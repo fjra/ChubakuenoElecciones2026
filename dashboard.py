@@ -145,7 +145,7 @@ def load_actas_pct_global(path: str) -> float:
                     pass
     except FileNotFoundError:
         pass
-    return round(cont / total * 100, 2) if total else 0.0
+    return round(cont / total * 100, 3) if total else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +204,11 @@ def build_snapshot(ts: str, inei_to_reniec: dict, todos_ubigeos: set,
         if reniec in imputaciones:
             imp      = imputaciones[reniec]
             cat      = scope_a_categoria(imp.get("scope", ""))
-            donor_ub = imp.get("donor_ubigeo", "").split("+")[0].strip().zfill(6)
-            votos    = votos_dist.get(donor_ub, {})
+            donor_ubs = [d.strip().zfill(6) for d in imp.get("donor_ubigeo", "").split("+") if d.strip()]
+            votos: dict[str, int] = {}
+            for donor_ub in donor_ubs:
+                for dni, v in votos_dist.get(donor_ub, {}).items():
+                    votos[dni] = votos.get(dni, 0) + v
             dni_win, _nom_win, pct_win = ganador_distrito(votos)
             data[iddist] = {
                 "c": COLORES.get(cat, COLORES["sin referencia"]),
@@ -246,6 +249,7 @@ def build_snapshot(ts: str, inei_to_reniec: dict, todos_ubigeos: set,
             }
 
     actas_pct = load_actas_pct_global(f"data/totales_distritos_{ts}.csv")
+
     return {"ts": ts, "label": ts_to_label(ts), "iso": ts_to_iso(ts), "unix": ts_to_unix(ts),
             "actas_pct": actas_pct, "data": data}
 
@@ -408,6 +412,128 @@ def build_chart_traces(timestamps: list[str], top_n: int | None,
 
 
 # ---------------------------------------------------------------------------
+# Trazas de votos reales (conteo sin proyectar)
+# ---------------------------------------------------------------------------
+
+def _scope_match_row(row: dict, scope: str) -> bool:
+    if scope == "todos":
+        return True
+    ambito = row.get("id_ambito_geografico", "").strip()
+    return ambito == ("2" if scope == "extranjero" else "1")
+
+
+def build_all_raw_traces(timestamps: list[str], top_n: int | None,
+                         scopes: list[str]) -> dict[str, list[dict]]:
+    """Lee cada participantes_distritos_TS.csv una sola vez y devuelve trazas para todos los scopes."""
+    from collections import defaultdict
+    if not timestamps:
+        return {}
+    last_path = f"data/participantes_distritos_{timestamps[-1]}.csv"
+    if not os.path.exists(last_path):
+        return {}
+
+    # Paso 1: top candidatos por scope desde el ultimo snapshot
+    totales_last: dict[str, dict[str, int]] = {s: defaultdict(int) for s in scopes}
+    nombres:  dict[str, str] = {}
+    partidos: dict[str, str] = {}
+    with open(last_path, newline="", encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            if row.get("error"):
+                continue
+            dni = row.get("dniCandidato", "").strip()
+            if not dni:
+                continue
+            nombres[dni]  = row.get("nombreCandidato", dni)
+            partidos[dni] = row.get("nombreAgrupacionPolitica", "")
+            try:
+                v = int(float(row.get("totalVotosValidos", 0) or 0))
+            except (ValueError, TypeError):
+                continue
+            for s in scopes:
+                if _scope_match_row(row, s):
+                    totales_last[s][dni] += v
+
+    top_dnis: dict[str, list[str]] = {}
+    top_sets: dict[str, set[str]]  = {}
+    for s in scopes:
+        ranked = sorted(totales_last[s], key=lambda d: -totales_last[s][d])
+        top_dnis[s] = ranked[:top_n] if top_n else ranked
+        top_sets[s] = set(top_dnis[s])
+    all_top = set().union(*top_sets.values())
+
+    # Paso 2: series temporales — un pase por archivo
+    xs = [ts_to_iso(ts) for ts in timestamps]
+    # series[scope][dni] -> (pct_list, abs_list)
+    series: dict[str, dict[str, tuple[list, list]]] = {
+        s: {d: ([], []) for d in top_dnis[s]} for s in scopes
+    }
+
+    for ts in timestamps:
+        path = f"data/participantes_distritos_{ts}.csv"
+        snap: dict[str, dict[str, int]] = {s: {} for s in scopes}
+        if os.path.exists(path):
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    if row.get("error"):
+                        continue
+                    dni = row.get("dniCandidato", "").strip()
+                    if dni not in all_top:
+                        continue
+                    try:
+                        v = int(float(row.get("totalVotosValidos", 0) or 0))
+                    except (ValueError, TypeError):
+                        continue
+                    for s in scopes:
+                        if dni in top_sets[s] and _scope_match_row(row, s):
+                            snap[s][dni] = snap[s].get(dni, 0) + v
+        for s in scopes:
+            total = sum(snap[s].values())
+            for dni in top_dnis[s]:
+                v = snap[s].get(dni)
+                pcts, abss = series[s][dni]
+                if total > 0 and v is not None:
+                    pcts.append(round(v / total * 100, 4))
+                    abss.append(v)
+                else:
+                    pcts.append(None)
+                    abss.append(None)
+
+    # Paso 3: construir trazas Plotly por scope
+    result: dict[str, list[dict]] = {}
+    for s in scopes:
+        top_sorted = sorted(top_dnis[s], key=lambda d: (series[s][d][0][-1] or 0), reverse=True)
+        traces = []
+        for dni in top_sorted:
+            pcts, abss = series[s][dni]
+            last_pct = pcts[-1] or 0
+            last_abs = totales_last[s].get(dni, 0)
+            color = COLORES_CANDIDATOS.get(dni)
+            trace: dict = {
+                "type": "scatter",
+                "mode": "lines+markers",
+                "name": f"{nombres.get(dni, dni)} ({last_pct:.2f}% · {last_abs:,})",
+                "x": xs,
+                "y": pcts,
+                "customdata": abss,
+                "hovertemplate": (
+                    f"<b>{nombres.get(dni, dni)}</b><br>"
+                    f"{partidos.get(dni, '')}<br>"
+                    "%{y:.3f}%  ·  %{customdata:,} votos"
+                    "<extra></extra>"
+                ),
+                "line":   {"width": 2},
+                "marker": {"size": 5},
+            }
+            if color:
+                trace["line"]["color"]   = color
+                trace["marker"]["color"] = color
+            traces.append(trace)
+        if traces:
+            result[s] = traces
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Generar HTML
 # ---------------------------------------------------------------------------
 
@@ -420,15 +546,17 @@ SCOPE_LABELS = {
 
 def generate_html(slim_geojson: dict, snapshots: list[dict],
                   all_traces: dict[str, list[dict]],
+                  all_raw_traces: dict[str, list[dict]],
                   pol_order: list[str] | None = None) -> str:
-    """all_traces: dict con claves "todos", "peru", "extranjero" (cualquier subconjunto)."""
+    """all_traces / all_raw_traces: dict con claves "todos", "peru", "extranjero"."""
     def gz_b64(obj) -> str:
         raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return base64.b64encode(gzip.compress(raw, compresslevel=9)).decode("ascii")
 
-    geojson_gz    = gz_b64(slim_geojson)
-    snapshots_gz  = gz_b64(snapshots)
-    all_traces_gz = gz_b64(all_traces)
+    geojson_gz        = gz_b64(slim_geojson)
+    snapshots_gz      = gz_b64(snapshots)
+    all_traces_gz     = gz_b64(all_traces)
+    all_raw_traces_gz = gz_b64(all_raw_traces)
 
     # Orden para la leyenda política: proyección > votos brutos
     ordered_dnis = pol_order if pol_order else list(COLORES_CANDIDATOS.keys())
@@ -496,14 +624,13 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px 14px;
+  gap: 8px 4px;
   box-shadow: 0 1px 4px rgba(0,0,0,0.1);
   flex-shrink: 0;
 }}
 #controls > label {{ font-size: 12px; color: #666; white-space: nowrap; }}
 #slider {{ flex: 1; min-width: 120px; accent-color: #1a1a2e; cursor: pointer; }}
 #ts-label {{ font-size: 14px; font-weight: 700; color: #1a1a2e; white-space: nowrap; }}
-#ts-counter {{ font-size: 11px; color: #999; white-space: nowrap; }}
 {tabs_css}
 
 #tab-group {{ display: flex; gap: 4px; flex-wrap: nowrap; align-items: center; flex-shrink: 0; }}
@@ -545,6 +672,16 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
 
 #map {{ flex: 1; min-height: 0; }}
 #chart {{ flex: 1; min-height: 0; }}
+#chart2 {{ flex: 1; min-height: 0; }}
+
+#right-col {{
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}}
+#right-col .panel:first-child {{ flex: 3; min-height: 0; }}
+#right-col .panel:last-child  {{ flex: 2; min-height: 0; }}
 
 /* ── Desktop: ocupa toda la pantalla sin scroll ─────────────────────────── */
 @media (min-width: 769px) {{
@@ -557,6 +694,7 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
   #main {{ grid-template-columns: 1fr; }}
   .panel {{ height: 72vw; min-height: 320px; max-height: 500px; }}
   .panel:first-child {{ min-height: 320px; max-height: none; }}
+  #right-col {{ display: contents; }}
 }}
 </style>
 </head>
@@ -574,9 +712,7 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
   </div>
   <input type="range" id="slider" min="{unix_first}" max="{unix_last}" value="{unix_init}" step="60">
   <span id="ts-label"></span>
-  <span id="ts-counter"></span>
-  <span style="margin-left:8px;font-size:13px;color:#444;display:none;">Actas contabilizadas:</span>
-  <span id="actas-pct" style="font-size:15px;font-weight:700;color:#1a1a2e;display:none;"></span>
+  <span id="actas-pct" style="font-size:14px;font-weight:700;color:#1a1a2e;"></span>
 </div>
 
 <div id="main">
@@ -584,9 +720,15 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
     <div class="panel-title" id="map-panel-title">Ganador por distrito</div>
     <div id="map"></div>
   </div>
-  <div class="panel">
-    <div class="panel-title">Evolucion de la proyeccion electoral</div>
-    <div id="chart"></div>
+  <div id="right-col">
+    <div class="panel">
+      <div class="panel-title">Evolucion de la proyeccion electoral</div>
+      <div id="chart"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Conteo actual de votos (sin proyectar)</div>
+      <div id="chart2"></div>
+    </div>
   </div>
 </div>
 
@@ -605,9 +747,10 @@ async function _gz(b64) {{
   return JSON.parse(new TextDecoder().decode(out));
 }}
 (async () => {{
-const GEOJSON    = await _gz('{geojson_gz}');
-const SNAPSHOTS  = await _gz('{snapshots_gz}');
-const ALL_TRACES = await _gz('{all_traces_gz}');
+const GEOJSON        = await _gz('{geojson_gz}');
+const SNAPSHOTS      = await _gz('{snapshots_gz}');
+const ALL_TRACES     = await _gz('{all_traces_gz}');
+const ALL_RAW_TRACES = await _gz('{all_raw_traces_gz}');
 let currentScope  = '{default_scope}';
 let viewMode      = 'pol';
 
@@ -727,6 +870,7 @@ geoLayer = L.geoJSON(GEOJSON, {{
     layer.bindTooltip(makeTooltip(currentIdx, feat), {{ sticky: true, maxWidth: 260 }});
     layer.on('mouseover', () => layer.setStyle({{ weight: 1.5, color: '#000', fillOpacity: 0.95 }}));
     layer.on('mouseout',  () => layer.setStyle(makeStyle(currentIdx, feat.properties.id)));
+    layer.on('click', e => layer.openTooltip(e.latlng));
   }},
 }}).addTo(map);
 
@@ -743,6 +887,10 @@ hatchLayer = L.geoJSON(GEOJSON, {{
     layer.on('mouseout', () => {{
       const base = layerByDist[feat.properties.id];
       if (base) base.fire('mouseout');
+    }});
+    layer.on('click', e => {{
+      const base = layerByDist[feat.properties.id];
+      if (base) base.fire('click', e);
     }});
   }},
 }}).addTo(map);
@@ -793,12 +941,28 @@ function chartLayout() {{
   }};
 }}
 
-function setScope(scope) {{
-  currentScope = scope;
-  Plotly.react('chart', ALL_TRACES[scope], chartLayout());
+function chart2Layout() {{
+  return {{
+    xaxis: {{ type: 'date', showgrid: true, gridcolor: '#eee', tickangle: -30, tickfont: {{ size: 11 }}, tickformat: '%d-%b %H:%M' }},
+    yaxis: {{ title: '%', showgrid: true, gridcolor: '#eee', ticksuffix: '%', tickfont: {{ size: 11 }}, autorange: true }},
+    hovermode: 'x unified',
+    showlegend: false,
+    plot_bgcolor: 'white', paper_bgcolor: 'white',
+    margin: {{ l: 45, r: 20, t: 8, b: 60 }},
+    shapes: [markerShape(SNAPSHOTS[currentIdx].iso)],
+    autosize: true,
+  }};
 }}
 
-Plotly.newPlot('chart', ALL_TRACES[currentScope], chartLayout(), {{ responsive: true }});
+function setScope(scope) {{
+  currentScope = scope;
+  Plotly.react('chart',  ALL_TRACES[scope],     chartLayout());
+  if (ALL_RAW_TRACES[scope])
+    Plotly.react('chart2', ALL_RAW_TRACES[scope], chart2Layout());
+}}
+
+Plotly.newPlot('chart',  ALL_TRACES[currentScope],     chartLayout(),  {{ responsive: true }});
+Plotly.newPlot('chart2', ALL_RAW_TRACES[currentScope] || [], chart2Layout(), {{ responsive: true }});
 
 // ── Tabs de ambito ────────────────────────────────────────────────────────
 {tabs_js}
@@ -806,8 +970,9 @@ Plotly.newPlot('chart', ALL_TRACES[currentScope], chartLayout(), {{ responsive: 
 // ── Slider ────────────────────────────────────────────────────────────────
 function updateLabel(idx) {{
   document.getElementById('ts-label').textContent = SNAPSHOTS[idx].label;
-  document.getElementById('ts-counter').textContent = `(${{idx + 1}} / ${{SNAPSHOTS.length}})`;
-  document.getElementById('actas-pct').textContent = SNAPSHOTS[idx].actas_pct.toFixed(2) + '%';
+  const _pct = SNAPSHOTS[idx].actas_pct.toFixed(3);
+  const _label = window.innerWidth <= 768 ? 'cont.' : 'contabilizadas';
+  document.getElementById('actas-pct').textContent = `(${{_label}} ${{_pct}}%)`;
 }}
 
 document.getElementById('slider').addEventListener('input', e => {{
@@ -817,7 +982,9 @@ document.getElementById('slider').addEventListener('input', e => {{
     Math.abs(s.unix - unix) < Math.abs(SNAPSHOTS[best].unix - unix) ? i : best, 0);
   updateLabel(currentIdx);
   updateMap(currentIdx, prevIdx);
-  Plotly.relayout('chart', {{ shapes: [markerShape(SNAPSHOTS[currentIdx].iso)] }});
+  const shape = {{ shapes: [markerShape(SNAPSHOTS[currentIdx].iso)] }};
+  Plotly.relayout('chart',  shape);
+  Plotly.relayout('chart2', shape);
 }});
 
 // ── Toggle imputaciones / ganador ────────────────────────────────────────
@@ -848,7 +1015,7 @@ function ajustarAlturasMobile() {{
   const padding   = 8;   // padding de #main
   const available = window.innerHeight - top - padding * 2 - gap;
   const mapPanel   = main.querySelector('.panel:first-child');
-  const chartPanel = main.querySelector('.panel:last-child');
+  const chartPanel = document.getElementById('chart').closest('.panel');
   mapPanel.style.height   = Math.round(available * 0.60) + 'px';
   chartPanel.style.height = Math.round(available * 0.40) + 'px';
 }}
@@ -966,9 +1133,17 @@ def main():
         print("Sin trazas disponibles, abortando.")
         return
 
+    # Trazas de votos reales (conteo sin proyectar) — un pase por archivo
+    print("Construyendo trazas de conteo real...")
+    all_raw_traces = build_all_raw_traces(timestamps, args.top, scopes=list(all_traces.keys()))
+    for key, traces in all_raw_traces.items():
+        print(f"  {len(traces)} candidatos raw ({key})")
+    if not all_raw_traces:
+        all_raw_traces = {"todos": []}
+
     # HTML
     print(f"Generando {output}...")
-    html = generate_html(slim_geojson, snapshots, all_traces, pol_order=proy_order)
+    html = generate_html(slim_geojson, snapshots, all_traces, all_raw_traces, pol_order=proy_order)
     with open(output, "w", encoding="utf-8") as f:
         f.write(html)
 
