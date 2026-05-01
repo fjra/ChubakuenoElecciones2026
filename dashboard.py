@@ -319,7 +319,7 @@ def load_snapshot_inputs_many(timestamps: list[str], workers: int = 1) -> list[d
     elif workers < -1:
         workers = 1
 
-    progress_cols = 6
+    progress_cols = 4
     progress_width = max((len(ts) for ts in timestamps), default=0) + 6
     progress_rows = (len(timestamps) + progress_cols - 1) // progress_cols
 
@@ -1194,6 +1194,8 @@ const DISTRICT_DATA  = await _gz('{district_data_gz}');
 let currentScope  = '{default_scope}';
 let viewMode      = 'pol';
 let hoveredDistrict = null;
+let selectedDistrict = null;
+let _clickedLayer = false;
 const SNAP_META = SNAPSHOTS.m;
 const SNAP_DATA = SNAPSHOTS.d;
 
@@ -1348,6 +1350,11 @@ function makeStyle(idx, iddist) {{
   return {{ fillColor: viewMode === 'pol' ? polColor(d[D_W]) : methodColor(d[D_M]), color: '#555', weight: 0.4, fillOpacity: 0.75 }};
 }}
 
+function makeSelectedStyle(idx, iddist) {{
+  const style = makeStyle(idx, iddist);
+  return {{ ...style, color: '#111', weight: 2.2, fillOpacity: 0.95 }};
+}}
+
 function makeHatchStyle(idx, iddist) {{
   const d = distData(idx, iddist);
   const visible = viewMode === 'pol' && isImputed(d);
@@ -1387,12 +1394,19 @@ geoLayer = L.geoJSON(GEOJSON, {{
     layerByDist[feat.properties.id] = layer;
     layer.bindTooltip(makeTooltip(currentIdx, feat), {{ sticky: true, maxWidth: 260 }});
     layer.on('mouseover', () => {{
-      layer.setStyle({{ weight: 1.5, color: '#000', fillOpacity: 0.95 }});
-      showDistrictChart(feat.properties.id, districtTitle(feat));
+      const iddist = feat.properties.id;
+      layer.setStyle(selectedDistrict === iddist ? makeSelectedStyle(currentIdx, iddist) : {{ weight: 1.5, color: '#000', fillOpacity: 0.95 }});
+      if (!selectedDistrict) showDistrictChart(iddist, districtTitle(feat));
     }});
     layer.on('mouseout',  () => {{
-      layer.setStyle(makeStyle(currentIdx, feat.properties.id));
-      restoreScopeChart();
+      const iddist = feat.properties.id;
+      layer.setStyle(selectedDistrict === iddist ? makeSelectedStyle(currentIdx, iddist) : makeStyle(currentIdx, iddist));
+      if (!selectedDistrict) restoreScopeChart();
+    }});
+    layer.on('click', e => {{
+      _clickedLayer = true;
+      if (e && e.originalEvent) L.DomEvent.stopPropagation(e.originalEvent);
+      toggleDistrictSelection(feat.properties.id, districtTitle(feat));
     }});
   }},
 }}).addTo(map);
@@ -1411,6 +1425,11 @@ hatchLayer = L.geoJSON(GEOJSON, {{
       const base = layerByDist[feat.properties.id];
       if (base) base.fire('mouseout');
     }});
+    layer.on('click', e => {{
+      _clickedLayer = true;
+      if (e && e.originalEvent) L.DomEvent.stopPropagation(e.originalEvent);
+      toggleDistrictSelection(feat.properties.id, districtTitle(feat));
+    }});
   }},
 }}).addTo(map);
 
@@ -1420,7 +1439,7 @@ function updateMap(idx, prevIdx = null) {{
     const d    = distData(idx, iddist);
     const dOld = forceAll ? null : distData(prevIdx, iddist);
     const styleChanged = forceAll || (viewMode === 'pol' ? d[D_W] !== dOld[D_W] : d[D_M] !== dOld[D_M]);
-    if (styleChanged) layer.setStyle(makeStyle(idx, iddist));
+    if (styleChanged) layer.setStyle(selectedDistrict === iddist ? makeSelectedStyle(idx, iddist) : makeStyle(idx, iddist));
     layer.setTooltipContent(makeTooltip(idx, layer.feature));
   }}
   for (const [iddist, layer] of Object.entries(hatchByDist)) {{
@@ -1561,6 +1580,10 @@ function districtProjectedTraces(iddist) {{
 
 function setScope(scope) {{
   currentScope = scope;
+  if (selectedDistrict && layerByDist[selectedDistrict]) {{
+    layerByDist[selectedDistrict].setStyle(makeStyle(currentIdx, selectedDistrict));
+  }}
+  selectedDistrict = null;
   hoveredDistrict = null;
   setRawPanelVisible(true);
   setChartTitles('Evolucion de la proyeccion electoral', 'Conteo actual de votos (sin proyectar)');
@@ -1577,13 +1600,31 @@ function showDistrictChart(iddist, title) {{
   Plotly.react('chart', projected, chartLayout());
 }}
 
-function restoreScopeChart() {{
-  if (!hoveredDistrict) return;
+function restoreScopeChart(force = false) {{
+  if (selectedDistrict && !force) return;
+  if (!hoveredDistrict && !force) return;
   hoveredDistrict = null;
   setRawPanelVisible(true);
   setChartTitles('Evolucion de la proyeccion electoral', 'Conteo actual de votos (sin proyectar)');
   Plotly.react('chart', ALL_TRACES[currentScope], chartLayout());
   Plotly.react('chart2', ALL_RAW_TRACES[currentScope] || [], chart2Layout());
+}}
+
+function toggleDistrictSelection(iddist, title) {{
+  if (selectedDistrict === iddist) {{
+    selectedDistrict = null;
+    const layer = layerByDist[iddist];
+    if (layer) layer.setStyle(makeStyle(currentIdx, iddist));
+    restoreScopeChart(true);
+    return;
+  }}
+  if (selectedDistrict && layerByDist[selectedDistrict]) {{
+    layerByDist[selectedDistrict].setStyle(makeStyle(currentIdx, selectedDistrict));
+  }}
+  selectedDistrict = iddist;
+  showDistrictChart(iddist, title);
+  const layer = layerByDist[iddist];
+  if (layer) layer.setStyle(makeSelectedStyle(currentIdx, iddist));
 }}
 
 Plotly.newPlot('chart', ALL_TRACES[currentScope], chartLayout(), {{ responsive: true }});
@@ -1627,6 +1668,15 @@ document.querySelectorAll('#view-tabs input').forEach(input => {{
 
 // Init
 updateLabel({init_idx});
+
+map.on('click', () => {{
+  if (_clickedLayer) {{ _clickedLayer = false; return; }}
+  if (!selectedDistrict) return;
+  const old = selectedDistrict;
+  selectedDistrict = null;
+  if (layerByDist[old]) layerByDist[old].setStyle(makeStyle(currentIdx, old));
+  restoreScopeChart(true);
+}});
 
 // Redibuja Leaflet si el contenedor cambia de tamaño (orientacion, resize)
 new ResizeObserver(() => map.invalidateSize()).observe(document.getElementById('map'));
