@@ -441,13 +441,11 @@ def build_district_chart_data(timestamps: list[str], geojson_iddists: set[str],
         totales = inputs["totales"]
         imputaciones = inputs["imputaciones"]
 
-        raw_by_dist = inputs["votos_dist"]
         projected_by_dist = {ub: _project_profile(ub, participantes, totales) for ub in participantes}
 
         snap: dict[str, dict] = {}
         for iddist in geojson_iddists:
             reniec = inei_to_reniec.get(iddist, iddist)
-            raw = raw_by_dist.get(reniec, {})
             projected = projected_by_dist.get(reniec, {})
 
             if reniec in imputaciones:
@@ -469,7 +467,7 @@ def build_district_chart_data(timestamps: list[str], geojson_iddists: set[str],
                     if blended:
                         projected = blended
 
-            snap[iddist] = {"raw": raw, "projected": projected}
+            snap[iddist] = {"projected": projected}
         per_ts.append(snap)
 
     final_idx = len(timestamps) - 1
@@ -483,23 +481,25 @@ def build_district_chart_data(timestamps: list[str], geojson_iddists: set[str],
         if top_n:
             dnis = dnis[:top_n]
 
-        cand_rows = []
+        totals = []
+        for snap in per_ts:
+            projected = snap.get(iddist, {}).get("projected", {})
+            totals.append(round(sum(projected.values())))
+
+        rows = [totals]
         for dni in dnis:
-            ys = []
             proj_votes = []
             for snap in per_ts:
                 item = snap.get(iddist, {})
                 projected = item.get("projected", {})
-                total_projected = sum(projected.values())
                 votos_proy = projected.get(dni, 0.0)
-                ys.append((votos_proy / total_projected * 100) if total_projected else None)
                 proj_votes.append(round(votos_proy))
 
             pol_idx = POL_INDEX.get(dni, POL_UNKNOWN)
             if pol_idx == POL_UNKNOWN:
                 continue
-            cand_rows.append([pol_idx, ys, proj_votes])
-        district_data[iddist] = cand_rows
+            rows.append([pol_idx, proj_votes])
+        district_data[iddist] = rows
 
     return district_data
 
@@ -1549,10 +1549,12 @@ function setRawPanelVisible(visible) {{
 const chartXs = SNAP_META.map(s => s.iso);
 
 function districtProjectedTraces(iddist) {{
-  const rows = DISTRICT_DATA[iddist];
-  if (!rows || !rows.length) return [];
-  return rows.map(row => {{
-    const [polId, pct, proy] = row;
+  const pack = DISTRICT_DATA[iddist];
+  if (!pack || pack.length < 2) return [];
+  const totals = pack[0] || [];
+  return pack.slice(1).map(row => {{
+    const [polId, proy] = row;
+    const pct = proy.map((v, i) => totals[i] > 0 ? v / totals[i] * 100 : null);
     const pol = POL_META[polId] || ['', '—', '', POL_OTROS];
     const nombre = pol[1];
     const partido = pol[2];
