@@ -18,6 +18,9 @@ import gzip
 import json
 import os
 import re
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -35,6 +38,48 @@ COLORES = {
     "departamento":             "#e63946",
     "perfil global extranjero": "#9b5de5",
     "sin referencia":           "#aaaaaa",
+}
+
+
+def step_start(label: str) -> float:
+    print(f"{label}...", end="", flush=True)
+    return time.perf_counter()
+
+
+def step_done(t0: float) -> None:
+    print(f" ({time.perf_counter() - t0:.3f} s)")
+
+METHOD_OWN = 0
+METHOD_CENTROID = 1
+METHOD_PROV_DEP = 2
+METHOD_FOREIGN = 3
+METHOD_UNKNOWN = 4
+POL_UNKNOWN = -1
+
+D_M = 0
+D_W = 1
+D_A = 2
+D_T = 3
+D_D = 4
+D_R = 5
+DIST_COL_COUNT = 6
+DIST_REQUIRED_COLS = 4
+PCT_SCALE = 100
+
+METHOD_META = [
+    ("Datos propios", "#a8d5a2", False),
+    ("Centroide", "#f4a261", True),
+    ("Prov/depto", "#e63946", True),
+    ("Extranjero", "#9b5de5", True),
+    ("Sin referencia", "#aaaaaa", False),
+]
+METHOD_IDS = {
+    "datos propios": METHOD_OWN,
+    "centroide": METHOD_CENTROID,
+    "provincia": METHOD_PROV_DEP,
+    "departamento": METHOD_PROV_DEP,
+    "perfil global extranjero": METHOD_FOREIGN,
+    "sin referencia": METHOD_UNKNOWN,
 }
 
 
@@ -121,6 +166,344 @@ def load_votos_por_distrito(path: str) -> dict[str, dict[str, int]]:
     return dict(votos)
 
 
+def load_participantes_por_distrito(path: str) -> dict[str, dict[str, dict]]:
+    """ubigeo -> dni -> metadatos + votos crudos, para ambito nacional."""
+    participantes: dict[str, dict[str, dict]] = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if row.get("error"):
+                    continue
+                if row.get("id_ambito_geografico", "1") != "1":
+                    continue
+                ub = row.get("ubigeo_distrito", "").zfill(6)
+                dni = row.get("dniCandidato", "").strip()
+                if not ub or not dni:
+                    continue
+                try:
+                    votos = int(float(row.get("totalVotosValidos", 0) or 0))
+                except (ValueError, TypeError):
+                    votos = 0
+                participantes.setdefault(ub, {})[dni] = {
+                    "nombre": row.get("nombreCandidato", dni),
+                    "partido": row.get("nombreAgrupacionPolitica", ""),
+                    "votos": votos,
+                }
+    except FileNotFoundError:
+        pass
+    return participantes
+
+
+def load_participantes_data(path: str) -> tuple[dict[str, dict[str, dict]], list[dict], dict[str, dict[str, int]]]:
+    """Participantes nacionales por distrito + filas minimas + agregados raw por scope."""
+    from collections import defaultdict
+    participantes: dict[str, dict[str, dict]] = {}
+    rows: list[dict] = []
+    raw_scope_totals: dict[str, dict[str, int]] = {
+        "todos": defaultdict(int),
+        "peru": defaultdict(int),
+        "extranjero": defaultdict(int),
+    }
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if row.get("error"):
+                    continue
+                dni = row.get("dniCandidato", "").strip()
+                if not dni:
+                    continue
+                try:
+                    votos = int(float(row.get("totalVotosValidos", 0) or 0))
+                except (ValueError, TypeError):
+                    votos = 0
+                item = {
+                    "id_ambito_geografico": row.get("id_ambito_geografico", "1").strip(),
+                    "dniCandidato": dni,
+                    "nombreCandidato": row.get("nombreCandidato", dni),
+                    "nombreAgrupacionPolitica": row.get("nombreAgrupacionPolitica", ""),
+                    "totalVotosValidos": votos,
+                }
+                rows.append(item)
+                raw_scope_totals["todos"][dni] += votos
+                if item["id_ambito_geografico"] == "2":
+                    raw_scope_totals["extranjero"][dni] += votos
+                else:
+                    raw_scope_totals["peru"][dni] += votos
+                if item["id_ambito_geografico"] != "1":
+                    continue
+                ub = row.get("ubigeo_distrito", "").zfill(6)
+                if not ub:
+                    continue
+                participantes.setdefault(ub, {})[dni] = {
+                    "nombre": item["nombreCandidato"],
+                    "partido": item["nombreAgrupacionPolitica"],
+                    "votos": votos,
+                }
+    except FileNotFoundError:
+        pass
+    return participantes, rows, {scope: dict(vals) for scope, vals in raw_scope_totals.items()}
+
+
+def load_totales_por_distrito(path: str) -> dict[str, dict]:
+    totales: dict[str, dict] = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if row.get("error"):
+                    continue
+                if row.get("id_ambito_geografico", "1") != "1":
+                    continue
+                ub = row.get("ubigeo_distrito", "").zfill(6)
+                if ub:
+                    totales[ub] = row
+    except FileNotFoundError:
+        pass
+    return totales
+
+
+def load_totales_y_actas_pct(path: str) -> tuple[dict[str, dict], float]:
+    """Totales nacionales por distrito y % global de actas en una sola pasada."""
+    totales: dict[str, dict] = {}
+    total_actas = cont_actas = 0
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if row.get("error"):
+                    continue
+                try:
+                    total_actas += int(float(row.get("totalActas", 0) or 0))
+                    cont_actas += int(float(row.get("contabilizadas", 0) or 0))
+                except (ValueError, TypeError):
+                    pass
+                if row.get("id_ambito_geografico", "1") != "1":
+                    continue
+                ub = row.get("ubigeo_distrito", "").zfill(6)
+                if ub:
+                    totales[ub] = row
+    except FileNotFoundError:
+        pass
+    actas_pct = round(cont_actas / total_actas * 100, 2) if total_actas else 0.0
+    return totales, actas_pct
+
+
+def votos_desde_participantes(participantes: dict[str, dict[str, dict]]) -> dict[str, dict[str, int]]:
+    return {
+        ub: {dni: cand["votos"] for dni, cand in cands.items()}
+        for ub, cands in participantes.items()
+    }
+
+
+def actas_desde_totales(totales: dict[str, dict]) -> dict[str, str]:
+    return {ub: row.get("actasContabilizadas", "") for ub, row in totales.items()}
+
+
+def load_snapshot_inputs(ts: str) -> dict:
+    totales, actas_pct = load_totales_y_actas_pct(f"data/totales_distritos_{ts}.csv")
+    participantes, participantes_rows, raw_scope_totals = load_participantes_data(f"data/participantes_distritos_{ts}.csv")
+    return {
+        "ts": ts,
+        "imputaciones": load_imputaciones(f"data/imputaciones_{ts}.csv"),
+        "totales": totales,
+        "actas_pct": actas_pct,
+        "participantes": participantes,
+        "participantes_rows": participantes_rows,
+        "raw_scope_totals": raw_scope_totals,
+        "votos_dist": votos_desde_participantes(participantes),
+        "actas_dict": actas_desde_totales(totales),
+    }
+
+
+def load_snapshot_inputs_many(timestamps: list[str], workers: int = 1) -> list[dict]:
+    if workers == -1:
+        workers = os.cpu_count() or 1
+    elif workers < -1:
+        workers = 1
+
+    progress_cols = 6
+    progress_width = max((len(ts) for ts in timestamps), default=0) + 6
+    progress_rows = (len(timestamps) + progress_cols - 1) // progress_cols
+
+    def progress_pos(idx: int) -> tuple[int, int]:
+        row = idx % progress_rows
+        col = idx // progress_rows
+        return row, col
+
+    def progress_cell(idx: int, done: bool) -> str:
+        mark = "x" if done else " "
+        return f"  [{mark}] {timestamps[idx]}".ljust(progress_width)
+
+    def print_pending() -> None:
+        for row in range(progress_rows):
+            parts = []
+            for col in range(progress_cols):
+                idx = col * progress_rows + row
+                if idx < len(timestamps):
+                    parts.append(progress_cell(idx, False))
+            print("".join(parts).rstrip())
+
+    def mark_done(idx: int) -> None:
+        row, col = progress_pos(idx)
+        lines_up = progress_rows - row
+        col_pos = col * progress_width
+        sys.stdout.write(
+            f"\033[{lines_up}A\r"
+            f"\033[{col_pos + 1}G"
+            f"{progress_cell(idx, True)}"
+            f"\033[{lines_up}B\r"
+        )
+        sys.stdout.flush()
+
+    if workers <= 1:
+        inputs = []
+        interactive = sys.stdout.isatty()
+        if interactive:
+            print_pending()
+        for idx, ts in enumerate(timestamps):
+            inputs.append(load_snapshot_inputs(ts))
+            if interactive:
+                mark_done(idx)
+            else:
+                print(f"  [x] {ts}")
+        return inputs
+
+    print(f"  usando {workers} workers")
+    interactive = sys.stdout.isatty()
+    if interactive:
+        print_pending()
+    results: list[dict | None] = [None] * len(timestamps)
+
+    try:
+        ex_ctx = ProcessPoolExecutor(max_workers=workers)
+        executor_name = "procesos"
+    except (OSError, PermissionError) as exc:
+        print(f"  [warn] No se pudo usar ProcessPoolExecutor ({exc}); usando threads.")
+        ex_ctx = ThreadPoolExecutor(max_workers=workers)
+        executor_name = "threads"
+
+    if not interactive:
+        print(f"  modo: {executor_name}")
+
+    with ex_ctx as ex:
+        futures = {
+            ex.submit(load_snapshot_inputs, ts): idx
+            for idx, ts in enumerate(timestamps)
+        }
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results[idx] = fut.result()
+            if interactive:
+                mark_done(idx)
+            else:
+                print(f"  [x] {timestamps[idx]}")
+    return [r for r in results if r is not None]
+
+
+def _flt(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (ValueError, TypeError):
+        return default
+
+
+def pct_to_int(value) -> int | str:
+    """Porcentaje a entero con dos decimales; conserva vacios como ''."""
+    if value in ("", None):
+        return ""
+    try:
+        return round(float(value) * PCT_SCALE)
+    except (ValueError, TypeError):
+        return ""
+
+
+def _project_profile(ubigeo: str, participantes: dict, totales: dict) -> dict[str, float]:
+    """Proyecta votos distritales con ratio simple de actas contabilizadas."""
+    cands = participantes.get(ubigeo, {})
+    if not cands:
+        return {}
+    actas_pct = _flt(totales.get(ubigeo, {}).get("actasContabilizadas", 0))
+    factor = 100.0 / actas_pct if actas_pct > 0 else 1.0
+    return {dni: meta["votos"] * factor for dni, meta in cands.items()}
+
+
+def build_district_chart_data(timestamps: list[str], geojson_iddists: set[str],
+                              inei_to_reniec: dict[str, str],
+                              top_n: int | None,
+                              snapshot_inputs: list[dict] | None = None) -> dict[str, dict]:
+    """Payload compacto por distrito para armar plots proyectados y crudos en JS."""
+    if not timestamps:
+        return {}
+    if snapshot_inputs is None:
+        snapshot_inputs = [load_snapshot_inputs(ts) for ts in timestamps]
+
+    per_ts: list[dict] = []
+    for inputs in snapshot_inputs:
+        participantes = inputs["participantes"]
+        totales = inputs["totales"]
+        imputaciones = inputs["imputaciones"]
+
+        raw_by_dist = inputs["votos_dist"]
+        projected_by_dist = {ub: _project_profile(ub, participantes, totales) for ub in participantes}
+
+        snap: dict[str, dict] = {}
+        for iddist in geojson_iddists:
+            reniec = inei_to_reniec.get(iddist, iddist)
+            raw = raw_by_dist.get(reniec, {})
+            projected = projected_by_dist.get(reniec, {})
+
+            if reniec in imputaciones:
+                donor_ubs = [
+                    u.strip().zfill(6)
+                    for u in imputaciones[reniec].get("donor_ubigeo", "").split("+")
+                    if u.strip() and not u.strip().startswith("PERFIL")
+                ]
+                if donor_ubs:
+                    target_actas = _flt(totales.get(reniec, {}).get("totalActas", 0))
+                    blended: dict[str, float] = {}
+                    for donor_ub in donor_ubs:
+                        donor_profile = projected_by_dist.get(donor_ub, {})
+                        donor_actas = _flt(totales.get(donor_ub, {}).get("totalActas", 0))
+                        scale = (target_actas / donor_actas) if donor_actas > 0 else 1.0
+                        weight = 1.0 / len(donor_ubs)
+                        for dni, votos in donor_profile.items():
+                            blended[dni] = blended.get(dni, 0.0) + votos * scale * weight
+                    if blended:
+                        projected = blended
+
+            snap[iddist] = {"raw": raw, "projected": projected}
+        per_ts.append(snap)
+
+    final_idx = len(timestamps) - 1
+    district_data: dict[str, dict] = {}
+
+    for iddist in geojson_iddists:
+        final_projected = per_ts[final_idx].get(iddist, {}).get("projected", {})
+        if not final_projected:
+            continue
+        dnis = sorted(final_projected, key=lambda d: final_projected[d], reverse=True)
+        if top_n:
+            dnis = dnis[:top_n]
+
+        cand_rows = []
+        for dni in dnis:
+            ys = []
+            proj_votes = []
+            for snap in per_ts:
+                item = snap.get(iddist, {})
+                projected = item.get("projected", {})
+                total_projected = sum(projected.values())
+                votos_proy = projected.get(dni, 0.0)
+                ys.append((votos_proy / total_projected * 100) if total_projected else None)
+                proj_votes.append(round(votos_proy))
+
+            pol_idx = POL_INDEX.get(dni, POL_UNKNOWN)
+            if pol_idx == POL_UNKNOWN:
+                continue
+            cand_rows.append([pol_idx, ys, proj_votes])
+        district_data[iddist] = cand_rows
+
+    return district_data
+
+
 def ganador_distrito(votos: dict[str, int]) -> tuple[str, str, float]:
     if not votos:
         return "", "Sin datos", 0.0
@@ -145,7 +528,7 @@ def load_actas_pct_global(path: str) -> float:
                     pass
     except FileNotFoundError:
         pass
-    return round(cont / total * 100, 3) if total else 0.0
+    return round(cont / total * 100, 2) if total else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -190,12 +573,16 @@ def ts_to_unix(ts: str) -> int:
 # ---------------------------------------------------------------------------
 
 def build_snapshot(ts: str, inei_to_reniec: dict, todos_ubigeos: set,
-                   geojson_iddists: set) -> dict:
-    """Devuelve {iddist: {c,p,s,r,a,d,g,t,i}} para un timestamp.
-    c=color, p=pol, s=scope, r=razon, a=actas, d=donor, g=ganador(dni), t=pct, i=imp"""
-    imputaciones = load_imputaciones(f"data/imputaciones_{ts}.csv")
-    actas_dict   = load_actas(f"data/totales_distritos_{ts}.csv")
-    votos_dist   = load_votos_por_distrito(f"data/participantes_distritos_{ts}.csv")
+                   geojson_iddists: set, inputs: dict | None = None) -> dict:
+    """Devuelve snapshots compactos por distrito.
+    Por distrito: [m, w, a, t, d, r]
+    m=metodo id, w=ganador id, a=actas, t=% ganador, d=donor, r=razon.
+    Los campos finales se omiten cuando estan vacios."""
+    if inputs is None:
+        inputs = load_snapshot_inputs(ts)
+    imputaciones = inputs["imputaciones"]
+    actas_dict   = inputs["actas_dict"]
+    votos_dist   = inputs["votos_dist"]
 
     data = {}
     for iddist in geojson_iddists:
@@ -204,54 +591,100 @@ def build_snapshot(ts: str, inei_to_reniec: dict, todos_ubigeos: set,
         if reniec in imputaciones:
             imp      = imputaciones[reniec]
             cat      = scope_a_categoria(imp.get("scope", ""))
-            donor_ubs = [d.strip().zfill(6) for d in imp.get("donor_ubigeo", "").split("+") if d.strip()]
-            votos: dict[str, int] = {}
-            for donor_ub in donor_ubs:
-                for dni, v in votos_dist.get(donor_ub, {}).items():
-                    votos[dni] = votos.get(dni, 0) + v
+            donor_ub = imp.get("donor_ubigeo", "").split("+")[0].strip().zfill(6)
+            votos    = votos_dist.get(donor_ub, {})
             dni_win, _nom_win, pct_win = ganador_distrito(votos)
-            data[iddist] = {
-                "c": COLORES.get(cat, COLORES["sin referencia"]),
-                "p": COLORES_CANDIDATOS.get(dni_win, COLOR_OTROS_POL),
-                "s": imp.get("scope", ""),
-                "r": imp.get("razon", ""),
-                "a": imp.get("actas_pct", ""),
-                "d": imp.get("donor_nombre", ""),
-                "g": dni_win,
-                "t": f"{pct_win:.1f}" if pct_win else "",
-                "i": True,
-            }
+            row = [
+                METHOD_IDS.get(cat, METHOD_IDS["sin referencia"]),
+                POL_INDEX.get(dni_win, POL_UNKNOWN),
+                pct_to_int(imp.get("actas_pct", "")),
+                pct_to_int(pct_win if pct_win else ""),
+            ]
+            donor = imp.get("donor_nombre", "")
+            razon = imp.get("razon", "")
+            if donor or razon:
+                row.extend([donor, razon])
+            data[iddist] = row
         elif reniec in todos_ubigeos:
             votos = votos_dist.get(reniec, {})
             dni_win, _nom_win, pct_win = ganador_distrito(votos)
-            data[iddist] = {
-                "c": COLORES["datos propios"],
-                "p": COLORES_CANDIDATOS.get(dni_win, COLOR_OTROS_POL),
-                "s": "datos propios",
-                "r": "",
-                "a": actas_dict.get(reniec, ""),
-                "d": "",
-                "g": dni_win,
-                "t": f"{pct_win:.1f}" if pct_win else "",
-                "i": False,
-            }
+            data[iddist] = [
+                METHOD_IDS["datos propios"],
+                POL_INDEX.get(dni_win, POL_UNKNOWN),
+                pct_to_int(actas_dict.get(reniec, "")),
+                pct_to_int(pct_win if pct_win else ""),
+            ]
         else:
-            data[iddist] = {
-                "c": COLORES["sin referencia"],
-                "p": COLOR_OTROS_POL,
-                "s": "sin poligono",
-                "r": "",
-                "a": "",
-                "d": "",
-                "g": "",
-                "t": "",
-                "i": False,
-            }
+            data[iddist] = [METHOD_IDS["sin referencia"], POL_UNKNOWN]
 
-    actas_pct = load_actas_pct_global(f"data/totales_distritos_{ts}.csv")
-
+    actas_pct = inputs["actas_pct"]
     return {"ts": ts, "label": ts_to_label(ts), "iso": ts_to_iso(ts), "unix": ts_to_unix(ts),
             "actas_pct": actas_pct, "data": data}
+
+
+def pack_snapshots_columnar(snapshots: list[dict], geojson_iddists: set[str]) -> dict:
+    """Convierte snapshots por timestamp a series por distrito.
+    Salida: {"m": metadata_por_timestamp, "d": {iddist: [mRle, wRle, a[], t[], dRle, rRle]}}."""
+    metadata = [
+        {
+            "ts": s["ts"],
+            "label": s["label"],
+            "iso": s["iso"],
+            "unix": s["unix"],
+            "actas_pct": s["actas_pct"],
+        }
+        for s in snapshots
+    ]
+    data: dict[str, list[list]] = {}
+    empty = [METHOD_IDS["sin referencia"], POL_UNKNOWN]
+
+    def rle(values: list) -> list:
+        if not values:
+            return []
+        encoded = []
+        prev = values[0]
+        run_len = 1
+        for value in values[1:]:
+            if value == prev:
+                run_len += 1
+            else:
+                encoded.extend([prev, run_len])
+                prev = value
+                run_len = 1
+        encoded.extend([prev, run_len])
+        return encoded
+
+    for iddist in geojson_iddists:
+        cols = [[] for _ in range(DIST_COL_COUNT)]
+        any_donor = False
+        any_reason = False
+        for snap in snapshots:
+            row = snap["data"].get(iddist, empty)
+            cols[D_M].append(row[D_M] if len(row) > D_M else METHOD_IDS["sin referencia"])
+            cols[D_W].append(row[D_W] if len(row) > D_W else POL_UNKNOWN)
+            cols[D_A].append(row[D_A] if len(row) > D_A else "")
+            cols[D_T].append(row[D_T] if len(row) > D_T else "")
+            donor = row[D_D] if len(row) > D_D else ""
+            reason = row[D_R] if len(row) > D_R else ""
+            cols[D_D].append(donor)
+            cols[D_R].append(reason)
+            any_donor = any_donor or bool(donor)
+            any_reason = any_reason or bool(reason)
+
+        used_cols = DIST_REQUIRED_COLS
+        if any_reason:
+            used_cols = D_R + 1
+        elif any_donor:
+            used_cols = D_D + 1
+        cols[D_M] = rle(cols[D_M])
+        cols[D_W] = rle(cols[D_W])
+        if any_donor:
+            cols[D_D] = rle(cols[D_D])
+        if any_reason:
+            cols[D_R] = rle(cols[D_R])
+        data[iddist] = cols[:used_cols]
+
+    return {"m": metadata, "d": data}
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +692,8 @@ def build_snapshot(ts: str, inei_to_reniec: dict, todos_ubigeos: set,
 # ---------------------------------------------------------------------------
 COLORES_CANDIDATOS: dict[str, str] = {}
 NOMBRES_CORTOS:    dict[str, str] = {}
+PARTIDOS_CANDIDATOS: dict[str, str] = {}
+POL_INDEX: dict[str, int] = {}
 COLOR_OTROS_POL = "#9ca3af"
 
 _PALETTE = [
@@ -286,34 +721,36 @@ _NAME_OVERRIDES: dict[str, str] = {
     "09177250": "RICARDO BELMONT",
 }
 
-def build_candidatos_meta(path: str, top_n: int = 12) -> None:
-    """Puebla COLORES_CANDIDATOS y NOMBRES_CORTOS desde el CSV de participantes."""
+def build_candidatos_meta_from_rows(rows: list[dict], top_n: int = 12) -> None:
+    """Puebla COLORES_CANDIDATOS y NOMBRES_CORTOS desde filas de participantes."""
     from collections import defaultdict
     totales: dict[str, int] = defaultdict(int)
     nombres: dict[str, str] = {}
-    try:
-        with open(path, newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                if row.get("error"):
-                    continue
-                dni = row.get("dniCandidato", "").strip()
-                nom = row.get("nombreCandidato", "").strip()
-                if not dni:
-                    continue
-                nombres[dni] = nom
-                try:
-                    totales[dni] += int(float(row.get("totalVotosValidos", 0) or 0))
-                except (ValueError, TypeError):
-                    pass
-    except FileNotFoundError:
+    partidos: dict[str, str] = {}
+    for row in rows:
+        dni = row.get("dniCandidato", "").strip()
+        nom = row.get("nombreCandidato", "").strip()
+        if not dni:
+            continue
+        nombres[dni] = nom
+        partidos[dni] = row.get("nombreAgrupacionPolitica", "")
+        try:
+            totales[dni] += int(float(row.get("totalVotosValidos", 0) or 0))
+        except (ValueError, TypeError):
+            pass
+
+    if not totales:
         return
 
     todos = sorted(totales, key=lambda d: -totales[d])
     top   = todos[:top_n]
     COLORES_CANDIDATOS.clear()
     NOMBRES_CORTOS.clear()
+    PARTIDOS_CANDIDATOS.clear()
+    POL_INDEX.clear()
     palette_idx = 0
-    for dni in todos:
+    for idx, dni in enumerate(todos):
+        POL_INDEX[dni] = idx
         if dni in _COLOR_OVERRIDES:
             COLORES_CANDIDATOS[dni] = _COLOR_OVERRIDES[dni]
         else:
@@ -323,8 +760,18 @@ def build_candidatos_meta(path: str, top_n: int = 12) -> None:
             NOMBRES_CORTOS[dni] = _NAME_OVERRIDES[dni]
         else:
             NOMBRES_CORTOS[dni] = nombres.get(dni, dni)
+        PARTIDOS_CANDIDATOS[dni] = partidos.get(dni, "")
     print(f"  {len(top)} candidatos con color propio:"
           + "".join(f"\n    {NOMBRES_CORTOS[d]} ({totales[d]:,})  {COLORES_CANDIDATOS[d]}" for d in top))
+
+
+def build_candidatos_meta(path: str, top_n: int = 12) -> None:
+    """Puebla COLORES_CANDIDATOS y NOMBRES_CORTOS desde el CSV de participantes."""
+    try:
+        _participantes, rows, _raw_scope_totals = load_participantes_data(path)
+    except FileNotFoundError:
+        return
+    build_candidatos_meta_from_rows(rows, top_n=top_n)
 
 
 # ---------------------------------------------------------------------------
@@ -423,69 +870,53 @@ def _scope_match_row(row: dict, scope: str) -> bool:
 
 
 def build_all_raw_traces(timestamps: list[str], top_n: int | None,
-                         scopes: list[str]) -> dict[str, list[dict]]:
-    """Lee cada participantes_distritos_TS.csv una sola vez y devuelve trazas para todos los scopes."""
+                         scopes: list[str],
+                         snapshot_inputs: list[dict] | None = None) -> dict[str, list[dict]]:
+    """Devuelve trazas raw para todos los scopes usando participantes ya cargados."""
     from collections import defaultdict
     if not timestamps:
         return {}
-    last_path = f"data/participantes_distritos_{timestamps[-1]}.csv"
-    if not os.path.exists(last_path):
+    if snapshot_inputs is None:
+        snapshot_inputs = [load_snapshot_inputs(ts) for ts in timestamps]
+    if not snapshot_inputs:
         return {}
 
-    # Paso 1: top candidatos por scope desde el ultimo snapshot
     totales_last: dict[str, dict[str, int]] = {s: defaultdict(int) for s in scopes}
     nombres:  dict[str, str] = {}
     partidos: dict[str, str] = {}
-    with open(last_path, newline="", encoding="utf-8-sig") as f:
-        for row in csv.DictReader(f):
-            if row.get("error"):
-                continue
-            dni = row.get("dniCandidato", "").strip()
-            if not dni:
-                continue
-            nombres[dni]  = row.get("nombreCandidato", dni)
-            partidos[dni] = row.get("nombreAgrupacionPolitica", "")
-            try:
-                v = int(float(row.get("totalVotosValidos", 0) or 0))
-            except (ValueError, TypeError):
-                continue
-            for s in scopes:
-                if _scope_match_row(row, s):
-                    totales_last[s][dni] += v
+    for row in snapshot_inputs[-1]["participantes_rows"]:
+        dni = row.get("dniCandidato", "").strip()
+        if not dni:
+            continue
+        nombres[dni]  = row.get("nombreCandidato", dni)
+        partidos[dni] = row.get("nombreAgrupacionPolitica", "")
+        try:
+            v = int(float(row.get("totalVotosValidos", 0) or 0))
+        except (ValueError, TypeError):
+            continue
+        for s in scopes:
+            if _scope_match_row(row, s):
+                totales_last[s][dni] += v
 
     top_dnis: dict[str, list[str]] = {}
-    top_sets: dict[str, set[str]]  = {}
+    top_sets: dict[str, set[str]] = {}
     for s in scopes:
         ranked = sorted(totales_last[s], key=lambda d: -totales_last[s][d])
         top_dnis[s] = ranked[:top_n] if top_n else ranked
         top_sets[s] = set(top_dnis[s])
     all_top = set().union(*top_sets.values())
 
-    # Paso 2: series temporales — un pase por archivo
     xs = [ts_to_iso(ts) for ts in timestamps]
-    # series[scope][dni] -> (pct_list, abs_list)
     series: dict[str, dict[str, tuple[list, list]]] = {
         s: {d: ([], []) for d in top_dnis[s]} for s in scopes
     }
 
-    for ts in timestamps:
-        path = f"data/participantes_distritos_{ts}.csv"
+    for inputs in snapshot_inputs:
         snap: dict[str, dict[str, int]] = {s: {} for s in scopes}
-        if os.path.exists(path):
-            with open(path, newline="", encoding="utf-8-sig") as f:
-                for row in csv.DictReader(f):
-                    if row.get("error"):
-                        continue
-                    dni = row.get("dniCandidato", "").strip()
-                    if dni not in all_top:
-                        continue
-                    try:
-                        v = int(float(row.get("totalVotosValidos", 0) or 0))
-                    except (ValueError, TypeError):
-                        continue
-                    for s in scopes:
-                        if dni in top_sets[s] and _scope_match_row(row, s):
-                            snap[s][dni] = snap[s].get(dni, 0) + v
+        raw_scope_totals = inputs["raw_scope_totals"]
+        for s in scopes:
+            source = raw_scope_totals.get(s, {})
+            snap[s] = {dni: source.get(dni, 0) for dni in top_dnis[s] if dni in source}
         for s in scopes:
             total = sum(snap[s].values())
             for dni in top_dnis[s]:
@@ -498,7 +929,6 @@ def build_all_raw_traces(timestamps: list[str], top_n: int | None,
                     pcts.append(None)
                     abss.append(None)
 
-    # Paso 3: construir trazas Plotly por scope
     result: dict[str, list[dict]] = {}
     for s in scopes:
         top_sorted = sorted(top_dnis[s], key=lambda d: (series[s][d][0][-1] or 0), reverse=True)
@@ -525,7 +955,7 @@ def build_all_raw_traces(timestamps: list[str], top_n: int | None,
                 "marker": {"size": 5},
             }
             if color:
-                trace["line"]["color"]   = color
+                trace["line"]["color"] = color
                 trace["marker"]["color"] = color
             traces.append(trace)
         if traces:
@@ -544,9 +974,10 @@ SCOPE_LABELS = {
 }
 
 
-def generate_html(slim_geojson: dict, snapshots: list[dict],
+def generate_html(slim_geojson: dict, snapshots: dict,
                   all_traces: dict[str, list[dict]],
                   all_raw_traces: dict[str, list[dict]],
+                  district_data: dict[str, dict],
                   pol_order: list[str] | None = None) -> str:
     """all_traces / all_raw_traces: dict con claves "todos", "peru", "extranjero"."""
     def gz_b64(obj) -> str:
@@ -557,16 +988,24 @@ def generate_html(slim_geojson: dict, snapshots: list[dict],
     snapshots_gz      = gz_b64(snapshots)
     all_traces_gz     = gz_b64(all_traces)
     all_raw_traces_gz = gz_b64(all_raw_traces)
+    district_data_gz  = gz_b64(district_data)
 
     # Orden para la leyenda política: proyección > votos brutos
     ordered_dnis = pol_order if pol_order else list(COLORES_CANDIDATOS.keys())
     pol_order_js = json.dumps(ordered_dnis, ensure_ascii=False)
+    method_meta_js = json.dumps(METHOD_META, ensure_ascii=False, separators=(",", ":"))
+    pol_meta = [
+        [dni, NOMBRES_CORTOS.get(dni, dni), PARTIDOS_CANDIDATOS.get(dni, ""), COLORES_CANDIDATOS.get(dni, COLOR_OTROS_POL)]
+        for dni in COLORES_CANDIDATOS.keys()
+    ]
+    pol_meta_js = json.dumps(pol_meta, ensure_ascii=False, separators=(",", ":"))
 
-    n          = len(snapshots)
+    snapshot_meta = snapshots["m"]
+    n          = len(snapshot_meta)
     init_idx   = n - 1
-    unix_first = snapshots[0]["unix"]
-    unix_last  = snapshots[-1]["unix"]
-    unix_init  = snapshots[init_idx]["unix"]
+    unix_first = snapshot_meta[0]["unix"]
+    unix_last  = snapshot_meta[-1]["unix"]
+    unix_init  = snapshot_meta[init_idx]["unix"]
 
     scopes        = list(all_traces.keys())
     default_scope = scopes[0]
@@ -624,7 +1063,7 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px 4px;
+  gap: 8px 14px;
   box-shadow: 0 1px 4px rgba(0,0,0,0.1);
   flex-shrink: 0;
 }}
@@ -722,11 +1161,11 @@ body {{ font-family: sans-serif; background: #f0f0f0; display: flex; flex-direct
   </div>
   <div id="right-col">
     <div class="panel">
-      <div class="panel-title">Evolucion de la proyeccion electoral</div>
+      <div class="panel-title" id="projected-title">Evolucion de la proyeccion electoral</div>
       <div id="chart"></div>
     </div>
     <div class="panel">
-      <div class="panel-title">Conteo actual de votos (sin proyectar)</div>
+      <div class="panel-title" id="raw-title">Conteo actual de votos (sin proyectar)</div>
       <div id="chart2"></div>
     </div>
   </div>
@@ -751,13 +1190,71 @@ const GEOJSON        = await _gz('{geojson_gz}');
 const SNAPSHOTS      = await _gz('{snapshots_gz}');
 const ALL_TRACES     = await _gz('{all_traces_gz}');
 const ALL_RAW_TRACES = await _gz('{all_raw_traces_gz}');
+const DISTRICT_DATA  = await _gz('{district_data_gz}');
 let currentScope  = '{default_scope}';
 let viewMode      = 'pol';
+let hoveredDistrict = null;
+const SNAP_META = SNAPSHOTS.m;
+const SNAP_DATA = SNAPSHOTS.d;
 
-const POL_COLORS = {json.dumps(COLORES_CANDIDATOS, ensure_ascii=False)};
-const POL_NAMES  = {json.dumps(NOMBRES_CORTOS, ensure_ascii=False)};
+const METHOD_META = {method_meta_js};
+const POL_META = {pol_meta_js};
+const POL_BY_DNI = Object.fromEntries(POL_META.map((p, i) => [p[0], i]));
 const POL_OTROS  = '{COLOR_OTROS_POL}';
 const POL_ORDER  = {pol_order_js};
+
+// SNAP_DATA[iddist] = [mRle, wRle, a[], t[], dRle, rRle]
+// RLE: [valor, largo, ...]. a: actas %, t: % ganador.
+const D_M = 0, D_W = 1, D_A = 2, D_T = 3, D_D = 4, D_R = 5;
+const METHOD_OWN = 0;
+const METHOD_CENTROID = 1;
+const METHOD_PROV_DEP = 2;
+const METHOD_FOREIGN = 3;
+const METHOD_UNKNOWN = METHOD_META.length - 1;
+const POL_UNKNOWN = -1;
+const PCT_SCALE = {PCT_SCALE};
+
+function methodMeta(id) {{
+  return METHOD_META[id] || METHOD_META[METHOD_META.length - 1];
+}}
+
+function methodColor(id) {{
+  return methodMeta(id)[1];
+}}
+
+function isImputed(d) {{
+  return !!methodMeta(d[D_M])[2];
+}}
+
+function polMeta(id) {{
+  return POL_META[id] || null;
+}}
+
+function polColor(id) {{
+  const p = polMeta(id);
+  return p ? p[3] : POL_OTROS;
+}}
+
+function polName(id) {{
+  const p = polMeta(id);
+  return p ? p[1] : '—';
+}}
+
+function rleValueAt(rle, idx, fallback) {{
+  if (!rle) return fallback;
+  let offset = 0;
+  for (let i = 0; i < rle.length; i += 2) {{
+    const value = rle[i];
+    const len = rle[i + 1] || 0;
+    if (idx < offset + len) return value;
+    offset += len;
+  }}
+  return fallback;
+}}
+
+function pctText(value) {{
+  return value !== undefined && value !== '' ? (value / PCT_SCALE).toFixed(2) + '%' : '—';
+}}
 
 // ── Mapa ──────────────────────────────────────────────────────────────────
 const isMobile = window.innerWidth <= 768;
@@ -769,13 +1266,16 @@ L.tileLayer('https://{{s}}.basemaps.cartocdn.com/light_all/{{z}}/{{x}}/{{y}}{{r}
 
 // Leyenda dinamica
 const IMP_LEGEND = [
-  ['#a8d5a2','Datos propios'],
-  ['#f4a261','Imputado — centroide'],
-  ['#e63946','Imputado — prov/depto'],
-  ['#9b5de5','Imputado — extranjero'],
-  ['#aaaaaa','Sin referencia / sin poligono'],
+  [METHOD_META[METHOD_OWN][1], METHOD_META[METHOD_OWN][0]],
+  [METHOD_META[METHOD_CENTROID][1], 'Imputado — ' + METHOD_META[METHOD_CENTROID][0].toLowerCase()],
+  [METHOD_META[METHOD_PROV_DEP][1], 'Imputado — ' + METHOD_META[METHOD_PROV_DEP][0].toLowerCase()],
+  [METHOD_META[METHOD_FOREIGN][1], 'Imputado — ' + METHOD_META[METHOD_FOREIGN][0].toLowerCase()],
+  [METHOD_META[METHOD_UNKNOWN][1], METHOD_META[METHOD_UNKNOWN][0] + ' / sin poligono'],
 ];
-const POL_LEGEND = POL_ORDER.slice(0, 5).map(dni => [POL_COLORS[dni], POL_NAMES[dni] || dni])
+const POL_LEGEND = POL_ORDER.slice(0, 5).map(dni => {{
+  const p = POL_META[POL_BY_DNI[dni]];
+  return [p ? p[3] : POL_OTROS, p ? p[1] : dni];
+}})
 ;
 
 function legendHTML(entries, title) {{
@@ -831,18 +1331,31 @@ const hatchByDist = {{}};
 let geoLayer, hatchLayer;
 
 function distData(idx, iddist) {{
-  return (SNAPSHOTS[idx].data[iddist] || {{ c: '#aaaaaa', p: '#aaaaaa', s: '—', r: '', a: '', d: '', g: '', t: '', i: false }});
+  const cols = SNAP_DATA[iddist];
+  if (!cols) return [METHOD_UNKNOWN, POL_UNKNOWN];
+  return [
+    rleValueAt(cols[D_M], idx, METHOD_UNKNOWN),
+    rleValueAt(cols[D_W], idx, POL_UNKNOWN),
+    cols[D_A] ? cols[D_A][idx] : '',
+    cols[D_T] ? cols[D_T][idx] : '',
+    rleValueAt(cols[D_D], idx, ''),
+    rleValueAt(cols[D_R], idx, ''),
+  ];
 }}
 
 function makeStyle(idx, iddist) {{
   const d = distData(idx, iddist);
-  return {{ fillColor: viewMode === 'pol' ? d.p : d.c, color: '#555', weight: 0.4, fillOpacity: 0.75 }};
+  return {{ fillColor: viewMode === 'pol' ? polColor(d[D_W]) : methodColor(d[D_M]), color: '#555', weight: 0.4, fillOpacity: 0.75 }};
 }}
 
 function makeHatchStyle(idx, iddist) {{
   const d = distData(idx, iddist);
-  const visible = viewMode === 'pol' && d.i;
+  const visible = viewMode === 'pol' && isImputed(d);
   return {{ fillColor: 'url(#imp-hatch)', fillOpacity: visible ? 1 : 0, color: 'none', weight: 0 }};
+}}
+
+function actasText(d) {{
+  return pctText(d[D_A]);
 }}
 
 function makeTooltip(idx, feat) {{
@@ -851,16 +1364,21 @@ function makeTooltip(idx, feat) {{
   const header = `<b>${{p.dist}}</b><br><span style="color:#777">${{p.prov}} — ${{p.dep}}</span><br>`;
   if (viewMode === 'pol') {{
     return header
-      + `<b>Ganador:</b> ${{(d.g ? (POL_NAMES[d.g] || d.g) : '—')}}<br>`
-      + (d.t ? `<b>% del total:</b> ${{d.t}}%<br>` : '')
-      + `<b>Actas:</b> ${{d.a !== '' ? d.a + '%' : '—'}}`
-      + (d.i ? `<br><i style="color:#888">via donor: ${{d.d}}</i>` : '');
+      + `<b>Ganador:</b> ${{polName(d[D_W])}}<br>`
+      + (d[D_T] !== undefined && d[D_T] !== '' ? `<b>% del total:</b> ${{pctText(d[D_T])}}<br>` : '')
+      + `<b>Actas:</b> ${{actasText(d)}}`
+      + (isImputed(d) && d[D_D] ? `<br><i style="color:#888">via donor: ${{d[D_D]}}</i>` : '');
   }}
   return header
-    + `<b>Metodo:</b> ${{d.s || '—'}}<br>`
-    + `<b>Actas:</b> ${{d.a !== '' ? d.a + '%' : '—'}}`
-    + (d.d ? `<br><b>Donor:</b> ${{d.d}}` : '')
-    + (d.r ? `<br><b>Razon:</b> ${{d.r}}` : '');
+    + `<b>Metodo:</b> ${{methodMeta(d[D_M])[0]}}<br>`
+    + `<b>Actas:</b> ${{actasText(d)}}`
+    + (d[D_D] ? `<br><b>Donor:</b> ${{d[D_D]}}` : '')
+    + (d[D_R] ? `<br><b>Razon:</b> ${{d[D_R]}}` : '');
+}}
+
+function districtTitle(feat) {{
+  const p = feat.properties;
+  return `Evolucion distrital - ${{p.dist}}, ${{p.prov}}`;
 }}
 
 geoLayer = L.geoJSON(GEOJSON, {{
@@ -868,9 +1386,14 @@ geoLayer = L.geoJSON(GEOJSON, {{
   onEachFeature(feat, layer) {{
     layerByDist[feat.properties.id] = layer;
     layer.bindTooltip(makeTooltip(currentIdx, feat), {{ sticky: true, maxWidth: 260 }});
-    layer.on('mouseover', () => layer.setStyle({{ weight: 1.5, color: '#000', fillOpacity: 0.95 }}));
-    layer.on('mouseout',  () => layer.setStyle(makeStyle(currentIdx, feat.properties.id)));
-    layer.on('click', e => layer.openTooltip(e.latlng));
+    layer.on('mouseover', () => {{
+      layer.setStyle({{ weight: 1.5, color: '#000', fillOpacity: 0.95 }});
+      showDistrictChart(feat.properties.id, districtTitle(feat));
+    }});
+    layer.on('mouseout',  () => {{
+      layer.setStyle(makeStyle(currentIdx, feat.properties.id));
+      restoreScopeChart();
+    }});
   }},
 }}).addTo(map);
 
@@ -888,10 +1411,6 @@ hatchLayer = L.geoJSON(GEOJSON, {{
       const base = layerByDist[feat.properties.id];
       if (base) base.fire('mouseout');
     }});
-    layer.on('click', e => {{
-      const base = layerByDist[feat.properties.id];
-      if (base) base.fire('click', e);
-    }});
   }},
 }}).addTo(map);
 
@@ -900,14 +1419,14 @@ function updateMap(idx, prevIdx = null) {{
   for (const [iddist, layer] of Object.entries(layerByDist)) {{
     const d    = distData(idx, iddist);
     const dOld = forceAll ? null : distData(prevIdx, iddist);
-    const styleChanged = forceAll || (viewMode === 'pol' ? d.p !== dOld.p : d.c !== dOld.c);
+    const styleChanged = forceAll || (viewMode === 'pol' ? d[D_W] !== dOld[D_W] : d[D_M] !== dOld[D_M]);
     if (styleChanged) layer.setStyle(makeStyle(idx, iddist));
     layer.setTooltipContent(makeTooltip(idx, layer.feature));
   }}
   for (const [iddist, layer] of Object.entries(hatchByDist)) {{
     const d    = distData(idx, iddist);
     const dOld = forceAll ? null : distData(prevIdx, iddist);
-    if (forceAll || d.i !== dOld.i) layer.setStyle(makeHatchStyle(idx, iddist));
+    if (forceAll || isImputed(d) !== isImputed(dOld)) layer.setStyle(makeHatchStyle(idx, iddist));
   }}
 }}
 
@@ -918,6 +1437,49 @@ function markerShape(label) {{
     x0: label, x1: label, y0: 0, y1: 1,
     line: {{ color: '#1a1a2e', width: 1.5, dash: 'dot' }},
   }};
+}}
+
+function imputationBandShapes(iddist) {{
+  if (!iddist) return [];
+  const methods = (SNAP_DATA[iddist] && SNAP_DATA[iddist][D_M]) || [];
+  if (!methodMeta(rleValueAt(methods, 0, METHOD_UNKNOWN))[2]) return [];
+  let firstOwnIdx = -1;
+  let offset = 0;
+  for (let i = 0; i < methods.length; i += 2) {{
+    const method = methods[i];
+    const len = methods[i + 1] || 0;
+    if (!methodMeta(method)[2]) {{
+      firstOwnIdx = offset;
+      break;
+    }}
+    offset += len;
+  }}
+  const start = SNAP_META[0].iso;
+  const end = firstOwnIdx >= 0 ? SNAP_META[firstOwnIdx].iso : SNAP_META[SNAP_META.length - 1].iso;
+  const shapes = [
+    {{
+      type: 'rect', xref: 'x', yref: 'paper',
+      x0: start, x1: end, y0: 0, y1: 1,
+      fillcolor: 'rgba(230, 57, 70, 0.10)',
+      line: {{ width: 0 }},
+      layer: 'below',
+    }},
+  ];
+  if (firstOwnIdx >= 0) {{
+    shapes.push({{
+      type: 'line', xref: 'x', yref: 'paper',
+      x0: end, x1: end, y0: 0, y1: 1,
+      line: {{ color: '#e63946', width: 1.2, dash: 'dash' }},
+    }});
+  }}
+  return shapes;
+}}
+
+function chartShapes() {{
+  return [
+    ...imputationBandShapes(hoveredDistrict),
+    markerShape(SNAP_META[currentIdx].iso),
+  ];
 }}
 
 function chartLayout() {{
@@ -936,7 +1498,7 @@ function chartLayout() {{
     }},
     plot_bgcolor: 'white', paper_bgcolor: 'white',
     margin: {{ l: 45, r: 20, t: 8, b: 60 }},
-    shapes: [markerShape(SNAPSHOTS[currentIdx].iso)],
+    shapes: chartShapes(),
     autosize: true,
   }};
 }}
@@ -949,19 +1511,82 @@ function chart2Layout() {{
     showlegend: false,
     plot_bgcolor: 'white', paper_bgcolor: 'white',
     margin: {{ l: 45, r: 20, t: 8, b: 60 }},
-    shapes: [markerShape(SNAPSHOTS[currentIdx].iso)],
+    shapes: chartShapes(),
     autosize: true,
   }};
 }}
 
-function setScope(scope) {{
-  currentScope = scope;
-  Plotly.react('chart',  ALL_TRACES[scope],     chartLayout());
-  if (ALL_RAW_TRACES[scope])
-    Plotly.react('chart2', ALL_RAW_TRACES[scope], chart2Layout());
+function setChartTitles(projected, raw) {{
+  document.getElementById('projected-title').textContent = projected;
+  document.getElementById('raw-title').textContent = raw;
 }}
 
-Plotly.newPlot('chart',  ALL_TRACES[currentScope],     chartLayout(),  {{ responsive: true }});
+function setRawPanelVisible(visible) {{
+  const panel = document.getElementById('chart2').closest('.panel');
+  panel.style.display = visible ? 'flex' : 'none';
+  setTimeout(() => Plotly.Plots.resize('chart'), 0);
+}}
+
+const chartXs = SNAP_META.map(s => s.iso);
+
+function districtProjectedTraces(iddist) {{
+  const rows = DISTRICT_DATA[iddist];
+  if (!rows || !rows.length) return [];
+  return rows.map(row => {{
+    const [polId, pct, proy] = row;
+    const pol = POL_META[polId] || ['', '—', '', POL_OTROS];
+    const nombre = pol[1];
+    const partido = pol[2];
+    const lastPct = [...pct].reverse().find(v => v !== null) || 0;
+    const lastProy = [...proy].reverse().find(v => v) || 0;
+    const color = pol[3];
+    const trace = {{
+      type: 'scatter',
+      mode: 'lines+markers',
+      name: `${{nombre}} (${{lastPct.toFixed(2)}}% · ${{lastProy.toLocaleString()}} proy.)`,
+      x: chartXs,
+      y: pct,
+      customdata: proy,
+      hovertemplate: `<b>${{nombre}}</b><br>${{partido}}<br>%{{y:.3f}}% proy. · %{{customdata:,}} votos proy.<extra></extra>`,
+      line: {{ width: 2 }},
+      marker: {{ size: 5 }},
+    }};
+    if (color) {{
+      trace.line.color = color;
+      trace.marker.color = color;
+    }}
+    return trace;
+  }});
+}}
+
+function setScope(scope) {{
+  currentScope = scope;
+  hoveredDistrict = null;
+  setRawPanelVisible(true);
+  setChartTitles('Evolucion de la proyeccion electoral', 'Conteo actual de votos (sin proyectar)');
+  Plotly.react('chart', ALL_TRACES[scope], chartLayout());
+  Plotly.react('chart2', ALL_RAW_TRACES[scope] || [], chart2Layout());
+}}
+
+function showDistrictChart(iddist, title) {{
+  const projected = districtProjectedTraces(iddist);
+  if (!projected.length) return;
+  hoveredDistrict = iddist;
+  setRawPanelVisible(false);
+  setChartTitles(`${{title}} - proyeccion`, 'Conteo actual de votos (sin proyectar)');
+  Plotly.react('chart', projected, chartLayout());
+}}
+
+function restoreScopeChart() {{
+  if (!hoveredDistrict) return;
+  hoveredDistrict = null;
+  setRawPanelVisible(true);
+  setChartTitles('Evolucion de la proyeccion electoral', 'Conteo actual de votos (sin proyectar)');
+  Plotly.react('chart', ALL_TRACES[currentScope], chartLayout());
+  Plotly.react('chart2', ALL_RAW_TRACES[currentScope] || [], chart2Layout());
+}}
+
+Plotly.newPlot('chart', ALL_TRACES[currentScope], chartLayout(), {{ responsive: true }});
 Plotly.newPlot('chart2', ALL_RAW_TRACES[currentScope] || [], chart2Layout(), {{ responsive: true }});
 
 // ── Tabs de ambito ────────────────────────────────────────────────────────
@@ -969,8 +1594,8 @@ Plotly.newPlot('chart2', ALL_RAW_TRACES[currentScope] || [], chart2Layout(), {{ 
 
 // ── Slider ────────────────────────────────────────────────────────────────
 function updateLabel(idx) {{
-  document.getElementById('ts-label').textContent = SNAPSHOTS[idx].label;
-  const _pct = SNAPSHOTS[idx].actas_pct.toFixed(3);
+  document.getElementById('ts-label').textContent = SNAP_META[idx].label;
+  const _pct = SNAP_META[idx].actas_pct.toFixed(3);
   const _label = window.innerWidth <= 768 ? 'cont.' : 'contabilizadas';
   document.getElementById('actas-pct').textContent = `(${{_label}} ${{_pct}}%)`;
 }}
@@ -978,12 +1603,12 @@ function updateLabel(idx) {{
 document.getElementById('slider').addEventListener('input', e => {{
   const unix = +e.target.value;
   const prevIdx = currentIdx;
-  currentIdx = SNAPSHOTS.reduce((best, s, i) =>
-    Math.abs(s.unix - unix) < Math.abs(SNAPSHOTS[best].unix - unix) ? i : best, 0);
+  currentIdx = SNAP_META.reduce((best, s, i) =>
+    Math.abs(s.unix - unix) < Math.abs(SNAP_META[best].unix - unix) ? i : best, 0);
   updateLabel(currentIdx);
   updateMap(currentIdx, prevIdx);
-  const shape = {{ shapes: [markerShape(SNAPSHOTS[currentIdx].iso)] }};
-  Plotly.relayout('chart',  shape);
+  const shape = {{ shapes: chartShapes() }};
+  Plotly.relayout('chart', shape);
   Plotly.relayout('chart2', shape);
 }});
 
@@ -1042,6 +1667,8 @@ def main():
                         help="Usar proyecciones solo-peru (proyeccion_final_peru_*.csv)")
     parser.add_argument("--solo-extranjero", action="store_true",
                         help="Usar proyecciones solo-extranjero (proyeccion_final_extranjero_*.csv)")
+    parser.add_argument("--workers", type=int, default=-1,
+                        help="Workers para cargar inputs por snapshot en paralelo (default: -1 = todos los procesadores; usar 1 para desactivar)")
     args = parser.parse_args()
 
     # Determinar modo y output
@@ -1061,9 +1688,12 @@ def main():
         return
     print(f"{len(timestamps)} snapshots: {', '.join(timestamps)}")
 
+    print("Cargando inputs por snapshot...")
+    snapshot_inputs = load_snapshot_inputs_many(timestamps, workers=args.workers)
+
     # Construir metadatos de candidatos desde el ultimo snapshot
     print("Construyendo metadatos de candidatos...")
-    build_candidatos_meta(f"data/participantes_distritos_{timestamps[-1]}.csv")
+    build_candidatos_meta_from_rows(snapshot_inputs[-1]["participantes_rows"])
 
     # Orden de candidatos segun ultima proyeccion
     proy_order: list[str] = []
@@ -1105,45 +1735,59 @@ def main():
     print(f"  {len(slim_features)} poligonos")
 
     # Snapshots (el mapa siempre usa imputaciones completas)
-    print("Procesando snapshots...")
+    t_step = step_start("Procesando snapshots")
     snapshots = []
-    for ts in timestamps:
-        print(f"  {ts}")
-        snapshots.append(build_snapshot(ts, inei_to_reniec, todos_ubigeos, geojson_iddists))
+    for inputs in snapshot_inputs:
+        snapshots.append(build_snapshot(inputs["ts"], inei_to_reniec, todos_ubigeos, geojson_iddists, inputs=inputs))
+    snapshots_packed = pack_snapshots_columnar(snapshots, geojson_iddists)
+    step_done(t_step)
 
     # Trazas del grafico
-    print("Construyendo trazas del grafico...")
+    t_step = step_start("Construyendo trazas del grafico")
     if sufijo is not None:
         # Modo único (--solo-peru o --solo-extranjero)
         all_traces = {"todos": build_chart_traces(timestamps, args.top, sufijo=sufijo)}
-        print(f"  {len(all_traces['todos'])} candidatos ({sufijo})")
+        trace_counts = [f"{len(all_traces['todos'])} candidatos ({sufijo})"]
     else:
         # Modo combinado: los tres ámbitos
         all_traces = {}
+        trace_counts = []
         for key, suf in [("todos", ""), ("peru", "_peru"), ("extranjero", "_extranjero")]:
             top_n = 8 if key == "extranjero" else args.top
             traces = build_chart_traces(timestamps, top_n, sufijo=suf)
             if traces:
                 all_traces[key] = traces
-                print(f"  {len(traces)} candidatos ({key})")
+                trace_counts.append(f"{len(traces)} candidatos ({key})")
             else:
-                print(f"  [warn] Sin datos para ambito '{key}', omitido del dashboard")
+                trace_counts.append(f"sin datos '{key}'")
+    step_done(t_step)
+    for msg in trace_counts:
+        print(f"  {msg}")
 
     if not all_traces:
         print("Sin trazas disponibles, abortando.")
         return
 
-    # Trazas de votos reales (conteo sin proyectar) — un pase por archivo
-    print("Construyendo trazas de conteo real...")
-    all_raw_traces = build_all_raw_traces(timestamps, args.top, scopes=list(all_traces.keys()))
+    t_step = step_start("Construyendo trazas de votos reales")
+    all_raw_traces = build_all_raw_traces(
+        timestamps, args.top, scopes=list(all_traces.keys()), snapshot_inputs=snapshot_inputs
+    )
+    step_done(t_step)
     for key, traces in all_raw_traces.items():
         print(f"  {len(traces)} candidatos raw ({key})")
     if not all_raw_traces:
         all_raw_traces = {"todos": []}
 
+    t_step = step_start("Construyendo datos distritales para hover")
+    district_data = build_district_chart_data(
+        timestamps, geojson_iddists, inei_to_reniec, args.top, snapshot_inputs=snapshot_inputs
+    )
+    step_done(t_step)
+    print(f"  {len(district_data)} distritos con serie temporal")
+
     # HTML
     print(f"Generando {output}...")
-    html = generate_html(slim_geojson, snapshots, all_traces, all_raw_traces, pol_order=proy_order)
+    html = generate_html(slim_geojson, snapshots_packed, all_traces, all_raw_traces, district_data, pol_order=proy_order)
     with open(output, "w", encoding="utf-8") as f:
         f.write(html)
 
