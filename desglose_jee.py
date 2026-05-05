@@ -200,6 +200,7 @@ def compute_rows(imputar_no_proc, imputar_jee,
 
         n_con_pdf = len(set().union(*mesas_por_tipo.values())) if mesas_por_tipo else 0
         s_jee = a_jee = 0
+        sub_rows = []
         for tipo, label_tipo in [("digital", "digital"), ("manual", "escaneado")]:
             d = {'S': 0, 'A': 0}
             n_tipo = set()
@@ -208,13 +209,18 @@ def compute_rows(imputar_no_proc, imputar_jee,
                     d['S'] += vals['S']; d['A'] += vals['A']
                     n_tipo |= mesas_por_tipo.get(t, set())
             s_jee += d['S']; a_jee += d['A']
-            rows.append({"label": f"  2{'a' if tipo=='digital' else 'b'}. JEE PDF {label_tipo}",
-                         "s": d['S'], "a": d['A'], "sub": True, "n": len(n_tipo)})
+            sub_rows.append({"label": f"  2{'a' if tipo=='digital' else 'b'}. JEE PDF {label_tipo}",
+                             "s": d['S'], "a": d['A'], "sub": True, "n": len(n_tipo)})
         rows.append({"label": "2. JEE con PDF", "s": s_jee, "a": a_jee, "n": n_con_pdf,
                      "note": f"{len(ya_contabilizadas)} contabilizadas excluidas"})
+        rows.extend(sub_rows)
+        if not imputar_no_proc:
+            rows.append({"label": "  No procesables con PDF (votos ignorados)", "s": 0, "a": 0,
+                         "sub": True, "n": n_noproc_pdf})
 
         sin_pdf = {c: i for c, i in todas_obs.items()
-                   if c not in mesas_jee_local and (c not in no_procesables or imputar_no_proc)}
+                   if c not in mesas_jee_local and c not in ya_contabilizadas
+                   and (c not in no_procesables or imputar_no_proc)}
         s_sin = a_sin = 0.0
         for mesa, id_a in sin_pdf.items():
             ub  = ubigeo_desde_id_acta(mesa, id_a)
@@ -224,12 +230,8 @@ def compute_rows(imputar_no_proc, imputar_jee,
         rows.append({"label": "3. JEE sin PDF (imputadas)", "s": s_sin, "a": a_sin,
                      "imputed": True, "n": len(sin_pdf)})
         if not imputar_no_proc:
-            rows.append({"label": "  No procesables (extrav./siniest./nulidad)", "s": 0, "a": 0,
-                         "sub": True, "n": n_no_proc, "note": "contabilizadas como 0"})
-            rows.append({"label": "    Con PDF (votos ignorados)", "s": 0, "a": 0,
-                         "subsub": True, "n": n_noproc_pdf})
-            rows.append({"label": "    Sin PDF (no imputadas)", "s": 0, "a": 0,
-                         "subsub": True, "n": n_noproc_sin_pdf})
+            rows.append({"label": "  No procesables sin PDF (no imputadas)", "s": 0, "a": 0,
+                         "sub": True, "n": n_noproc_sin_pdf})
 
     s_pend = a_pend = 0.0
     n_pend = 0
@@ -249,6 +251,57 @@ def compute_rows(imputar_no_proc, imputar_jee,
     at = a_raw + a_jee + a_sin + a_pend
     rows.append({"label": "TOTAL ESTIMADO", "s": st, "a": at, "total": True, "imputed": True})
     return rows
+
+
+# ---------- desglose por ambito geografico -----------------------------------
+
+def compute_ambito(imputar_no_proc, imputar_jee,
+                   votos_mesa_data, ya_contabilizadas, no_procesables,
+                   todas_obs, ub_amb, avg, jee_jn,
+                   noproc_por_k, mesa_amb):
+    res = {'1': {'S': 0.0, 'A': 0.0, 'n': 0}, '2': {'S': 0.0, 'A': 0.0, 'n': 0}}
+
+    def add(amb, s, a, n=0):
+        key = amb if amb in res else '1'
+        res[key]['S'] += s
+        res[key]['A'] += a
+        res[key]['n'] += n
+
+    if imputar_jee:
+        for k, jee_n in jee_jn.items():
+            if not imputar_no_proc:
+                jee_n -= noproc_por_k.get(k, 0)
+            if jee_n <= 0:
+                continue
+            ub, amb = k
+            av = avg.get(k, (0.0, 0.0))
+            add(amb, av[0] * jee_n, av[1] * jee_n, jee_n)
+    else:
+        mesas_jee_local = set()
+        mesas_pdf_amb: dict[str, str] = {}
+        for r in votos_mesa_data:
+            fila = int(r['fila']); v = inte(r['valor']); mesa = r['codigoMesa']
+            mesas_jee_local.add(mesa)
+            if mesa in ya_contabilizadas or (mesa in no_procesables and not imputar_no_proc):
+                continue
+            amb = mesa_amb.get(mesa, '1')
+            mesas_pdf_amb[mesa] = amb
+            if fila == FILA_S: add(amb, v, 0)
+            if fila == FILA_A: add(amb, 0, v)
+        for amb in set(mesas_pdf_amb.values()):
+            key = amb if amb in res else '1'
+            res[key]['n'] += sum(1 for a in mesas_pdf_amb.values() if a == amb)
+
+        sin_pdf = {c: i for c, i in todas_obs.items()
+                   if c not in mesas_jee_local and c not in ya_contabilizadas
+                   and (c not in no_procesables or imputar_no_proc)}
+        for mesa, id_a in sin_pdf.items():
+            ub  = ubigeo_desde_id_acta(mesa, id_a)
+            amb = ub_amb.get(ub, '1')
+            av  = avg.get((ub, amb), (0.0, 0.0))
+            add(amb, av[0], av[1], 1)
+
+    return res
 
 
 # ---------- renderizado consola ----------------------------------------------
@@ -273,7 +326,9 @@ def render_console(rows):
 # ---------- renderizado HTML -------------------------------------------------
 
 def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
-                snapshot, obs_path, detalle_path, out_path="data/desglose_jee.html"):
+                snapshot, obs_path, detalle_path,
+                amb_default=None, amb_imputar=None,
+                out_path="data/desglose_jee.html"):
     from datetime import datetime
 
     def fmt_int(v, imputed=False):
@@ -319,6 +374,31 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
             "</tr></thead><tbody>\n"
             + build_tbody(rows)
             + "</tbody></table>"
+        )
+
+    def ambito_table(amb):
+        if not amb:
+            return ""
+        rows_html = ""
+        labels = [("1", "Nacional"), ("2", "Extranjero")]
+        for key, label in labels:
+            d = amb.get(key, {"S": 0.0, "A": 0.0, "n": 0})
+            s, a, n = d["S"], d["A"], d["n"]
+            diff = s - a
+            dcls = "pos" if diff > 0 else ("neg" if diff < 0 else "")
+            dsign = "+" if diff >= 0 else "&#8722;"
+            rows_html += (
+                f'<tr><td class="lbl">{label}'
+                f'<span class="note">{n:,} actas</span></td>'
+                f'<td class="num s">{s:,.0f}</td>'
+                f'<td class="num a">{a:,.0f}</td>'
+                f'<td class="num diff {dcls}">{dsign}{abs(diff):,.0f}</td></tr>\n'
+            )
+        return (
+            '<table class="ambito-tbl"><thead><tr>'
+            '<th class="lbl">&Aacute;mbito</th>'
+            '<th>S&aacute;nchez</th><th>Aliaga</th><th>S&minus;A</th>'
+            f'</tr></thead><tbody>{rows_html}</tbody></table>'
         )
 
     def total_row(rows):
@@ -394,6 +474,9 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
   .badge.pdf{{background:#14291f;color:#6ee7b7}}
   .badge.nopdf{{background:#2a1515;color:#fca5a5}}
   td.ctr{{text-align:center}}
+  table.ambito-tbl{{margin-top:10px;font-size:.8rem}}
+  table.ambito-tbl th{{font-size:.68rem}}
+  table.ambito-tbl td.lbl{{color:#94a3b8}}
 </style>
 </head>
 <body>
@@ -412,6 +495,7 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
       <span class="diff-chip">{sign(dd)}{abs(dd):,.0f} S&minus;A</span>
     </div>
     {scenario_table(rows_default)}
+    {ambito_table(amb_default)}
   </div>
   <div>
     <div class="scenario-hdr hdr-imputar">
@@ -419,6 +503,7 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
       <span class="diff-chip">{sign(di)}{abs(di):,.0f} S&minus;A</span>
     </div>
     {scenario_table(rows_imputar)}
+    {ambito_table(amb_imputar)}
   </div>
 </div>
 
@@ -472,10 +557,11 @@ def main():
     n_cont   = sum(cont.values())
 
     # ---- cargar JSONL ----
-    estado_mesa:        dict[str, str]  = {}
-    no_procesables:     set[str]        = set()
-    mesas_presidenciales: set[str]      = set()
-    detalle_obj:        dict[str, dict] = {}
+    estado_mesa:        dict[str, str]       = {}
+    no_procesables:     set[str]             = set()
+    no_proc_codigo:     dict[str, set[str]]  = {}
+    mesas_presidenciales: set[str]           = set()
+    detalle_obj:        dict[str, dict]      = {}
     detalle_path = args.detalle_jsonl or (
         (sorted(glob.glob("data/detalle_actas_????????_????.jsonl")) or [None])[-1]
     )
@@ -497,11 +583,13 @@ def main():
                 codigo = obj.get("codigoEstadoActa", "")
                 estado_mesa[mesa] = codigo
                 res = (obj.get("estadoActaResolucion") or "")
-                if codigo not in ("C", "L") and {r.strip() for r in res.split(",")} & NO_PROC_CODES:
+                codes_res = {r.strip() for r in res.split(",")} & NO_PROC_CODES
+                if codigo != "C" and codes_res:
                     no_procesables.add(mesa)
+                    no_proc_codigo[mesa] = codes_res
                 detalle_obj[mesa] = obj
 
-    ya_contabilizadas = {m for m, e in estado_mesa.items() if e in ("C", "L")}
+    ya_contabilizadas = {m for m, e in estado_mesa.items() if e == "C"}
 
     # ---- mapa ubigeo -> ambito ----
     ub_amb = {}
@@ -523,15 +611,6 @@ def main():
             id_acta[cm]   = r["id"]
             todas_obs[cm] = r["id"]
 
-    # ---- no procesables por distrito ----
-    noproc_por_k: dict[tuple, int] = defaultdict(int)
-    for mesa in no_procesables:
-        if mesa in id_acta:
-            ub  = ubigeo_desde_id_acta(mesa, id_acta[mesa])
-            amb = ub_amb.get(ub, "1")
-            noproc_por_k[(ub, amb)] += 1
-    n_no_proc = len({c for c in todas_obs if c in no_procesables})
-
     # ---- cargar votos_mesa en memoria (se reutiliza en ambas versiones) ----
     votos_mesa_data = []
     mesas_jee       = set()
@@ -540,7 +619,21 @@ def main():
             votos_mesa_data.append(r)
             mesas_jee.add(r["codigoMesa"])
 
-    n_noproc_pdf     = len({c for c in todas_obs if c in no_procesables and c in mesas_jee})
+    # Actas extraviadas/siniestradas con PDF recuperado: sacar de no_procesables
+    # (sus votos ya están capturados). Las de nulidad se mantienen aunque tengan PDF.
+    no_procesables -= {m for m in mesas_jee
+                       if no_proc_codigo.get(m, set()) <= {'X', 'Y'}
+                       and 'N' not in no_proc_codigo.get(m, set())}
+
+    # ---- no procesables por distrito ----
+    noproc_por_k: dict[tuple, int] = defaultdict(int)
+    for mesa in no_procesables:
+        if mesa in id_acta:
+            ub  = ubigeo_desde_id_acta(mesa, id_acta[mesa])
+            amb = ub_amb.get(ub, "1")
+            noproc_por_k[(ub, amb)] += 1
+    n_no_proc     = len({c for c in todas_obs if c in no_procesables})
+    n_noproc_pdf  = len({c for c in todas_obs if c in no_procesables and c in mesas_jee})
     n_noproc_sin_pdf = n_no_proc - n_noproc_pdf
 
     # ---- calcular ambas versiones ----
@@ -558,9 +651,29 @@ def main():
     rows_default = compute_rows(imputar_no_proc=False, **shared)
     rows_imputar = compute_rows(imputar_no_proc=True,  **shared)
 
+    # ---- desglose por ambito ----
+    mesa_amb = {}
+    for mesa, id_a in id_acta.items():
+        try:
+            ub = ubigeo_desde_id_acta(mesa, id_a)
+            mesa_amb[mesa] = ub_amb.get(ub, "1")
+        except Exception:
+            mesa_amb[mesa] = "1"
+    amb_shared = dict(
+        imputar_jee=args.imputar_jee,
+        votos_mesa_data=votos_mesa_data,
+        ya_contabilizadas=ya_contabilizadas, no_procesables=no_procesables,
+        todas_obs=todas_obs, ub_amb=ub_amb,
+        avg=avg, jee_jn=jee_jn,
+        noproc_por_k=noproc_por_k, mesa_amb=mesa_amb,
+    )
+    amb_default = compute_ambito(imputar_no_proc=False, **amb_shared)
+    amb_imputar = compute_ambito(imputar_no_proc=True,  **amb_shared)
+
     # ---- anexo A: sin PDF (version conservadora, sin no-procesables) ----
     sin_pdf_default = {c: i for c, i in todas_obs.items()
-                       if c not in mesas_jee and c not in no_procesables}
+                       if c not in mesas_jee and c not in no_procesables
+                       and c not in ya_contabilizadas}
     sin_pdf_annex = []
     for mesa, id_a in sorted(sin_pdf_default.items()):
         obj = detalle_obj.get(mesa, {})
@@ -591,7 +704,8 @@ def main():
 
     render_console(rows_default)
     render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
-                snapshot, obs_path, detalle_path)
+                snapshot, obs_path, detalle_path,
+                amb_default=amb_default, amb_imputar=amb_imputar)
 
 
 if __name__ == "__main__":
