@@ -362,7 +362,11 @@ def build_dashboard(df: pd.DataFrame, urb: pd.DataFrame) -> go.Figure:
         title=dict(
             text=(
                 "<b>Pobreza monetaria distrital 2018 vs votos presidenciales 2026</b><br>"
-                "<sup>Fuente pobreza: INEI 2018 · Fuente votos: ONPE 2026 primera vuelta · "
+                "<sup>Fuente pobreza: "
+                "<a href='https://www.gob.pe/institucion/inei/informes-publicaciones/3204872-mapa-de-pobreza-provincial-y-distrital-2018' target='_blank'>"
+                "INEI 2018 (Anexo estadístico)</a> · Fuente votos: "
+                "<a href='https://resultadoelectoral.onpe.gob.pe/main/resumen' target='_blank'>"
+                "ONPE 2026 primera vuelta</a> · "
                 "Tamaño de punto proporcional a votos válidos</sup>"
             ),
             x=0.5, xanchor="center",
@@ -394,6 +398,7 @@ def build_full_html(fig: go.Figure, table_data: list, ubigeo_to_idx: dict,
         buf,
         include_plotlyjs="cdn",
         full_html=True,
+        div_id="dataviz-dashboard-plot",
         config={"displayModeBar": True, "scrollZoom": True},
     )
     html = buf.getvalue()
@@ -402,7 +407,7 @@ def build_full_html(fig: go.Figure, table_data: list, ubigeo_to_idx: dict,
         raw = json.dumps(
             obj, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
-        return base64.b64encode(gzip.compress(raw, compresslevel=9)).decode("ascii")
+        return base64.b64encode(gzip.compress(raw, compresslevel=9, mtime=0)).decode("ascii")
 
     ubigeo_to_idx_gz = gzip_json_b64(ubigeo_to_idx)
     table_data_gz = gzip_json_b64(table_data)
