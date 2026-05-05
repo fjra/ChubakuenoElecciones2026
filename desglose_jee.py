@@ -421,9 +421,10 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
     for a in noproc_annex:
         badge = ('<span class="badge pdf">Con PDF</span>' if a["tiene_pdf"]
                  else '<span class="badge nopdf">Sin PDF</span>')
+        stae_badge = '<span class="badge stae">STAE</span>' if a.get("stae") else '<span class="badge conv">Conv.</span>'
         ann_b += (f'<tr><td>{a["mesa"]}</td><td>{a["dpto"]}</td><td>{a["prov"]}</td>'
                   f'<td>{a["dist"]}</td><td>{a["local"]}</td>'
-                  f'<td>{a["razon"]}</td><td class="ctr">{badge}</td></tr>\n')
+                  f'<td>{a["razon"]}</td><td class="ctr">{badge}</td><td class="ctr">{stae_badge}</td></tr>\n')
 
     now = datetime.now().strftime("%d/%m/%Y %H:%M")
     html = f"""<!DOCTYPE html>
@@ -473,6 +474,8 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
   .badge{{font-size:.68rem;padding:2px 6px;border-radius:999px;font-weight:600;white-space:nowrap}}
   .badge.pdf{{background:#14291f;color:#6ee7b7}}
   .badge.nopdf{{background:#2a1515;color:#fca5a5}}
+  .badge.stae{{background:#1e1a2e;color:#a78bfa}}
+  .badge.conv{{background:#1a1a1a;color:#64748b}}
   td.ctr{{text-align:center}}
   table.ambito-tbl{{margin-top:10px;font-size:.8rem}}
   table.ambito-tbl th{{font-size:.68rem}}
@@ -521,7 +524,7 @@ def render_html(rows_default, rows_imputar, sin_pdf_annex, noproc_annex,
 <table class="annex"><thead><tr>
   <th class="lbl">Mesa</th><th class="lbl">Dpto</th><th class="lbl">Provincia</th>
   <th class="lbl">Distrito</th><th class="lbl">Local de votaci&oacute;n</th>
-  <th class="lbl">Raz&oacute;n</th><th>PDF</th>
+  <th class="lbl">Raz&oacute;n</th><th>PDF</th><th>Sistema</th>
 </tr></thead><tbody>
 {ann_b}</tbody></table>
 </div>
@@ -692,6 +695,8 @@ def main():
         obj   = detalle_obj.get(mesa, {})
         res   = (obj.get("estadoActaResolucion") or "")
         codes = {r.strip() for r in res.split(",")} & NO_PROC_LABEL.keys()
+        sol   = obj.get("descripcionSolucionTecnologica", "") or ""
+        stae  = "STAE" in sol.upper() or "APOYO" in sol.upper()
         noproc_annex.append({
             "mesa"     : mesa,
             "dpto"     : obj.get("ubigeoNivel01", ""),
@@ -700,6 +705,7 @@ def main():
             "local"    : obj.get("nombreLocalVotacion", ""),
             "razon"    : ", ".join(NO_PROC_LABEL[c] for c in sorted(codes)),
             "tiene_pdf": mesa in mesas_jee,
+            "stae"     : stae,
         })
 
     render_console(rows_default)
