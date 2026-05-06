@@ -21,21 +21,33 @@ from plotly.utils import PlotlyJSONEncoder
 
 
 BASE_DIR = Path(__file__).resolve().parent
-GEOJSON_PATH = BASE_DIR / "peru_distrital.geojson"
+GEOJSON_PATH = BASE_DIR / "dataviz_data" / "onpe_simplificado" / "onpe_peru_distrital_simplificado_10pct.geojson"
 CENTROIDS_PATH = BASE_DIR / "ubigeo_centroides.csv"
 DOCS_DIR = BASE_DIR / "docs"
 DATA_DIR = BASE_DIR / "dataviz_data"
 OUT_HTML = DOCS_DIR / "grafo_adyacencia_distritos.html"
 OUT_EDGES = DATA_DIR / "adyacencias_distritales.csv"
 OUT_NODES = DATA_DIR / "nodos_distritales.csv"
+ONPE_PUNO_PROVINCE_GEOJSON = DATA_DIR / "onpe_200100.json"
 
+GEOJSON_ID_FIELD = "UBIGEO"  # "IDDIST" para MINAM/ONPE, "UBIGEO" para INEI 2023
 COORD_PRECISION = 7
 SHOW_GRAPH_OVERLAY = False
+FLIP_WINDING = False
 FOUR_COLOR_PALETTE = {
-    0: ("Color 1", "#2f6fbb"),
-    1: ("Color 2", "#d95f02"),
-    2: ("Color 3", "#1b9e77"),
-    3: ("Color 4", "#cc4778"),
+    0: ("Azul", "#2f6fbb"),
+    1: ("Naranja", "#d95f02"),
+    2: ("Verde", "#1b9e77"),
+    3: ("Rosa", "#cc4778"),
+}
+
+AUXILIARY_GEOMETRIES = {
+    "210103": {
+        "path": ONPE_PUNO_PROVINCE_GEOJSON,
+        "property": "DISTRITO",
+        "value": "AMANTANI",
+        "source_label": "ONPE provincias/200100.json",
+    },
 }
 
 
@@ -66,12 +78,83 @@ def polygon_rings(geometry: dict[str, Any] | None) -> list[list[list[float]]]:
     return []
 
 
+def _ring_signed_area(ring: list[list[float]]) -> float:
+    area = 0.0
+    for i in range(len(ring) - 1):
+        x1, y1 = ring[i][0], ring[i][1]
+        x2, y2 = ring[i + 1][0], ring[i + 1][1]
+        area += x1 * y2 - x2 * y1
+    return area / 2.0
+
+
+def fix_winding(geometry: dict[str, Any], flip: bool = False) -> dict[str, Any]:
+    geom_type = geometry.get("type")
+    coords = geometry.get("coordinates", [])
+
+    def fix_ext(ring: list) -> list:
+        if flip:
+            return ring[::-1]
+        return ring[::-1] if _ring_signed_area(ring) > 0 else ring
+
+    def fix_hole(ring: list) -> list:
+        if flip:
+            return ring[::-1]
+        return ring[::-1] if _ring_signed_area(ring) < 0 else ring
+
+    if geom_type == "Polygon":
+        return {**geometry, "coordinates": [fix_ext(coords[0])] + [fix_hole(r) for r in coords[1:]]}
+    if geom_type == "MultiPolygon":
+        return {**geometry, "coordinates": [
+            [fix_ext(p[0])] + [fix_hole(r) for r in p[1:]] for p in coords
+        ]}
+    return geometry
+
+
 def slim_feature_for_html(feature: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "Feature",
-        "properties": {"IDDIST": feature["properties"]["IDDIST"]},
-        "geometry": feature["geometry"],
+        "properties": {GEOJSON_ID_FIELD: feature["properties"][GEOJSON_ID_FIELD]},
+        "geometry": fix_winding(feature["geometry"], flip=FLIP_WINDING),
     }
+
+
+def patch_auxiliary_geometries(geojson: dict[str, Any]) -> dict[str, Any]:
+    patched = 0
+    by_ubigeo = {
+        norm_ubigeo(feature["properties"][GEOJSON_ID_FIELD]): feature
+        for feature in geojson["features"]
+    }
+
+    for ubigeo, source in AUXILIARY_GEOMETRIES.items():
+        target = by_ubigeo.get(ubigeo)
+        if not target or target.get("geometry"):
+            continue
+        source_path = source["path"]
+        if not source_path.exists():
+            print(f"  Aviso: no se encontro geometria auxiliar {source_path}")
+            continue
+
+        aux_geojson = json.loads(source_path.read_text(encoding="utf-8-sig"))
+        aux_feature = next(
+            (
+                feature
+                for feature in aux_geojson.get("features", [])
+                if str(feature.get("properties", {}).get(source["property"], "")).upper()
+                == str(source["value"]).upper()
+            ),
+            None,
+        )
+        if not aux_feature or not aux_feature.get("geometry"):
+            print(f"  Aviso: no se encontro {source['value']} en {source_path}")
+            continue
+
+        target["geometry"] = aux_feature["geometry"]
+        target["properties"]["GEOM_SOURCE"] = source["source_label"]
+        patched += 1
+
+    if patched:
+        print(f"  {patched:,} geometria auxiliar aplicada")
+    return geojson
 
 
 def build_adjacencies(geojson: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -83,14 +166,15 @@ def build_adjacencies(geojson: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFra
 
     for feature in features:
         props = feature["properties"]
-        ubigeo = norm_ubigeo(props["IDDIST"])
+        ubigeo = norm_ubigeo(props[GEOJSON_ID_FIELD])
         feature_rows.append(
             {
                 "ubigeo": ubigeo,
-                "departamento_geo": props.get("NOMBDEP", ""),
-                "provincia_geo": props.get("NOMBPROV", ""),
-                "distrito_geo": props.get("NOMBDIST", ""),
+                "departamento_geo": props.get("NOMBDEP") or props.get("DEPARTAMEN", ""),
+                "provincia_geo": props.get("NOMBPROV") or props.get("PROVINCIA", ""),
+                "distrito_geo": props.get("NOMBDIST") or props.get("DISTRITO", ""),
                 "tiene_geometria": bool(feature.get("geometry")),
+                "fuente_geometria": props.get("GEOM_SOURCE", "peru_distrital.geojson"),
             }
         )
 
@@ -117,39 +201,16 @@ def build_adjacencies(geojson: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFra
 
 
 def load_nodes_with_centroids(nodes: pd.DataFrame, edges: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    centroids = pd.read_csv(CENTROIDS_PATH, dtype={"inei": str, "reniec": str})
-    centroids["ubigeo"] = centroids["inei"].map(norm_ubigeo)
-    centroids["latitude"] = pd.to_numeric(centroids["latitude"], errors="coerce")
-    centroids["longitude"] = pd.to_numeric(centroids["longitude"], errors="coerce")
-
-    merged = nodes.merge(
-        centroids[
-            [
-                "ubigeo",
-                "departamento",
-                "provincia",
-                "distrito",
-                "latitude",
-                "longitude",
-                "pob_densidad_2020",
-                "altitude",
-                "pct_pobreza_total",
-            ]
-        ],
-        on="ubigeo",
-        how="left",
-    )
-    merged = merged.dropna(subset=["latitude", "longitude"]).copy()
-
-    valid = set(merged["ubigeo"])
-    edges = edges[edges["source"].isin(valid) & edges["target"].isin(valid)].copy()
-
+    out = nodes.copy()
     degree = pd.concat([edges["source"], edges["target"]]).value_counts()
-    merged["grado"] = merged["ubigeo"].map(degree).fillna(0).astype(int)
-    merged["nombre"] = merged["distrito"].fillna(merged["distrito_geo"]).str.title()
-    merged["departamento_label"] = merged["departamento"].fillna(merged["departamento_geo"]).str.title()
-    merged["provincia_label"] = merged["provincia"].fillna(merged["provincia_geo"]).str.title()
-    return merged, edges
+    out["grado"] = out["ubigeo"].map(degree).fillna(0).astype(int)
+    out["nombre"] = out["distrito_geo"].str.title()
+    out["departamento_label"] = out["departamento_geo"].str.title()
+    out["provincia_label"] = out["provincia_geo"].str.title()
+    out["pct_pobreza_total"] = float("nan")
+    out["latitude"] = float("nan")
+    out["longitude"] = float("nan")
+    return out, edges
 
 
 def four_color_nodes(nodes: pd.DataFrame, edges: pd.DataFrame) -> pd.DataFrame:
@@ -198,29 +259,45 @@ def edge_coordinates(nodes: pd.DataFrame, edges: pd.DataFrame) -> tuple[list[flo
 
 
 def build_figure(geojson: dict[str, Any], nodes: pd.DataFrame, edges: pd.DataFrame) -> go.Figure:
+    valid = set(nodes["ubigeo"])
     mapped_features = [
         slim_feature_for_html(feature)
         for feature in geojson["features"]
-        if feature.get("geometry")
+        if feature.get("geometry") and norm_ubigeo(feature["properties"][GEOJSON_ID_FIELD]) in valid
     ]
     missing_geometry = int((~nodes["tiene_geometria"]).sum())
     isolated = int((nodes["grado"] == 0).sum())
     island_names = nodes[(nodes["grado"] == 0) & nodes["tiene_geometria"]]["nombre"].tolist()
     island_note = ""
     if island_names:
-        island_note = f"; {len(island_names):,} isla: {', '.join(island_names)}"
+        island_word = "isla" if len(island_names) == 1 else "islas"
+        island_note = f"; {len(island_names):,} {island_word}: {', '.join(island_names)}"
 
     fig = go.Figure()
-    feature_colors = nodes.set_index("ubigeo")["color4"].to_dict()
+    node_info = nodes.set_index("ubigeo", drop=False)
+    feature_colors = node_info["color4"].to_dict()
     mapped_geojson = {**geojson, "features": mapped_features}
-    mapped_locations = [feature["properties"]["IDDIST"] for feature in mapped_features]
+    mapped_locations = [feature["properties"][GEOJSON_ID_FIELD] for feature in mapped_features]
+    district_hover = node_info.loc[
+        mapped_locations,
+        [
+            "ubigeo",
+            "departamento_label",
+            "provincia_label",
+            "grado",
+            "pct_pobreza_total",
+            "color4_label",
+        ],
+    ]
 
     fig.add_trace(
         go.Choropleth(
             geojson=mapped_geojson,
             locations=mapped_locations,
             z=[feature_colors[ubigeo] for ubigeo in mapped_locations],
-            featureidkey="properties.IDDIST",
+            customdata=district_hover.values,
+            text=node_info.loc[mapped_locations, "nombre"].tolist(),
+            featureidkey=f"properties.{GEOJSON_ID_FIELD}",
             colorscale=[
                 [0.00, FOUR_COLOR_PALETTE[0][1]],
                 [0.25, FOUR_COLOR_PALETTE[0][1]],
@@ -236,7 +313,14 @@ def build_figure(geojson: dict[str, Any], nodes: pd.DataFrame, edges: pd.DataFra
             marker_line_color="#d5d9df",
             marker_line_width=0.35,
             showscale=False,
-            hoverinfo="skip",
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Ubigeo: %{customdata[0]}<br>"
+                "%{customdata[1]} / %{customdata[2]}<br>"
+                "Vecinos: %{customdata[3]}<br>"
+                "4-coloracion: %{customdata[5]}"
+                "<extra></extra>"
+            ),
             name="Distritos 4-coloreados",
             showlegend=False,
         )
@@ -322,7 +406,7 @@ def build_figure(geojson: dict[str, Any], nodes: pd.DataFrame, edges: pd.DataFra
                 "Grafo de adyacencia distrital del Peru<br>"
                 f"<sup>4-coloracion validada · {len(edges):,} aristas por frontera compartida · "
                 f"{isolated:,} distritos aislados ({missing_geometry:,} sin geometria{island_note}) · "
-                "Chucuito, Puno, Puno tiene dos partes</sup>"
+                "Chucuito y Acora son discontinuo</sup>"
             ),
             x=0.5,
             xanchor="center",
@@ -416,15 +500,15 @@ def write_compressed_html(fig: go.Figure, out_html: Path) -> None:
 def main() -> None:
     print("Cargando GeoJSON distrital...")
     geojson = json.loads(GEOJSON_PATH.read_text(encoding="utf-8"))
+    geojson = patch_auxiliary_geometries(geojson)
     print(f"  {len(geojson['features']):,} poligonos distritales")
 
     print("Calculando aristas por frontera compartida...")
     geo_nodes, edges = build_adjacencies(geojson)
     print(f"  {len(edges):,} aristas topologicas")
 
-    print("Uniendo centroides...")
     nodes, edges = load_nodes_with_centroids(geo_nodes, edges)
-    print(f"  {len(nodes):,} nodos con centroide; {len(edges):,} aristas finales")
+    print(f"  {len(nodes):,} nodos; {len(edges):,} aristas")
 
     print("Calculando 4-coloracion...")
     nodes = four_color_nodes(nodes, edges)
