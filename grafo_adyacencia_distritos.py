@@ -3,7 +3,10 @@
 
 Cada nodo es un distrito ubicado en el centroide de ``ubigeo_centroides.csv`` y
 cada arista conecta dos distritos que comparten al menos un segmento de frontera
-en ``peru_distrital.geojson``.
+en ``onpe_peru_distrital_simplificado_10pct.geojson``.
+
+Este geojson es una version simplificada por simplificar_onpe_geojson.py
+a traves de mapshaper del GPKG distrital de INEI 2023.
 """
 
 from __future__ import annotations
