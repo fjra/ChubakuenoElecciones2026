@@ -1,5 +1,4 @@
 codigoLocalVotacion,nombreLocalVotacion,reniec,inei,departamento,provincia,distrito,match_metodo,match_detalle,iiee_codigo_institucion,iiee_codigo_modular,iiee_nombre,iiee_ubigeo,iiee_codigo_local,iiee_direccion,iiee_nivel,iiee_gestion,iiee_latitud,iiee_longitud,iiee_altitud
-55135,IE BOCA CHINGANAZA,010602,010403,AMAZONAS,CONDORCANQUI,RIO SANTIAGO,geocoding,geocoding_APPROXIMATE,,,,,,"Chinganaza 01840, Perú",,,-3.9205782,-77.74928,
 55154,IE DOS DE MAYO,010602,010403,AMAZONAS,CONDORCANQUI,RIO SANTIAGO,geocoding,geocoding_APPROXIMATE,,,,,,"Dos de Mayo 01840, Perú",,,-3.2012982,-77.8179135,
 54848,IE SAN PEDRO,020203,020202,ANCASH,AIJA,CORIS,geocoding,geocoding_APPROXIMATE,,,,,,"Coris 02621, Perú",,,-9.8206097,-77.71943379999999,
 54936,CASA COMUNAL,030301,030201,APURIMAC,ANDAHUAYLAS,ANDAHUAYLAS,geocoding,geocoding_APPROXIMATE,,,,,,"Andahuaylas, Perú",,,-13.6616515,-73.3767641,
