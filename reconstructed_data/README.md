@@ -27,6 +27,6 @@ nombres que aparecen en `locales_con_iiee.csv` (INEI).
 
 ## Notas
 
-En el detalle de cada acta del API de la ONPE **no tiene codigo de local** en el deta: solo se identifican por ubigeo (`ubigeoNivel01/02/03`) y nombre. Para cruzarlos con otras fuentes es necesario usar esos literales como clave de join.
+En el detalle de cada acta del API de la ONPE **no tiene codigo de local** en el deta: solo se identifican por ubigeo (`ubigeoNivel01/02/03`) y nombre. **Hay varios locales con exactamente el mismo nombre**, pero nunca comparten a la vez los mismos ubigeos. Para cruzarlos con otras fuentes es necesario usar esos literales como clave de join.
 
 Dado que los nombres de distrito no siempre coinciden entre la ONPE y otras bases, se construyó la tabla `onpe_to_locales.csv` para normalizar las diferencias antes de hacer el cruce.
