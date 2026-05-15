@@ -10,7 +10,7 @@ Locales de votación de la ONPE cruzados con una multitud de base de datos: ONPE
 | `nombreLocalVotacion` | Nombre del local según ONPE |
 | `reniec` / `inei` | Ubigeo de distrito (RENIEC e INEI) |
 | `departamento` / `provincia` / `distrito` | Jerarquía geográfica |
-| `match_metodo` / `match_detalle` | Método usado para vincular ONPE ↔ IIEE |
+| `match_metodo` / `match_detalle` | Método usado para vincular ONPE <-> Local |
 | `iiee_*` | Datos del Minedu: código de IE, nombre, dirección, nivel, coordenadas, altitud |
 
 ### `onpe_to_inei.csv`
